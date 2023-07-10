@@ -1,17 +1,20 @@
 package ftp
 
 import (
-	"github.com/fsnotify/fsnotify"
-	"github.com/secsy/goftp"
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
+	"github.com/secsy/goftp"
 )
 
 type FTP struct {
 	Config
 	Client *goftp.Client
+	mutex  sync.Mutex
 }
 
 type Config struct {
@@ -19,29 +22,27 @@ type Config struct {
 	Port     string
 	Username string
 	Password string
-	options  map[string]string
 }
 
-func New(config Config) *FTP {
+func New(config Config) (*FTP, error) {
 	cfg := goftp.Config{
 		User:               config.Username,
 		Password:           config.Password,
 		ConnectionsPerHost: 10,
-		Timeout:            60 * time.Second,
+		Timeout:            30 * time.Second,
 		Logger:             os.Stderr, // Logs to standard error
 	}
 
 	client, err := goftp.DialConfig(cfg, config.Host+":"+config.Port)
-
 	if err != nil {
-		log.Fatalf("Failed to connect to FTP server: %v", err)
-		return nil
+		return nil, err
 	}
 
 	return &FTP{
 		Config: config,
 		Client: client,
-	}
+		mutex:  sync.Mutex{},
+	}, nil
 }
 
 func (ftp *FTP) WatchDirectory(localPath string, remotePath string) {
@@ -62,7 +63,7 @@ func (ftp *FTP) WatchDirectory(localPath string, remotePath string) {
 				log.Println("event:", event)
 				if event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create {
 					log.Println("modified file:", event.Name)
-					ftp.uploadFile(event.Name, remotePath)
+					go ftp.uploadFile(event.Name, remotePath)
 				}
 			case err, ok := <-watcher.Errors:
 				if !ok {
@@ -96,6 +97,9 @@ func (ftp *FTP) WatchDirectory(localPath string, remotePath string) {
 }
 
 func (ftp *FTP) uploadFile(localPath string, remotePath string) {
+	ftp.mutex.Lock()
+	defer ftp.mutex.Unlock()
+
 	// check if remote directory exists and is empty
 	files, err := ftp.Client.ReadDir(remotePath)
 	if err != nil {
