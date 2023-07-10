@@ -1,6 +1,7 @@
 package ftp
 
 import (
+	"context"
 	"log"
 	"os"
 	"path/filepath"
@@ -15,6 +16,8 @@ type FTP struct {
 	Config
 	Client *goftp.Client
 	mutex  sync.Mutex
+	ctx    context.Context    // Context field
+	cancel context.CancelFunc // Cancel function field
 }
 
 type Config struct {
@@ -38,10 +41,14 @@ func New(config Config) (*FTP, error) {
 		return nil, err
 	}
 
+	ctx, cancel := context.WithCancel(context.Background()) // Create a cancelable context
+
 	return &FTP{
 		Config: config,
 		Client: client,
 		mutex:  sync.Mutex{},
+		ctx:    ctx,    // Initialize with created context
+		cancel: cancel, // Initialize with created cancel function
 	}, nil
 }
 
@@ -52,7 +59,6 @@ func (ftp *FTP) WatchDirectory(localPath string, remotePath string) {
 	}
 	defer watcher.Close()
 
-	done := make(chan bool)
 	go func() {
 		for {
 			select {
@@ -70,6 +76,8 @@ func (ftp *FTP) WatchDirectory(localPath string, remotePath string) {
 					return
 				}
 				log.Println("error:", err)
+			case <-ftp.ctx.Done():
+				return
 			}
 		}
 	}()
@@ -93,7 +101,7 @@ func (ftp *FTP) WatchDirectory(localPath string, remotePath string) {
 		log.Println("ERROR", err)
 	}
 
-	<-done
+	<-ftp.ctx.Done()
 }
 
 func (ftp *FTP) uploadFile(localPath string, remotePath string) {
@@ -123,4 +131,18 @@ func (ftp *FTP) uploadFile(localPath string, remotePath string) {
 	}
 
 	defer file.Close()
+}
+
+func (ftp *FTP) Close() error {
+	ftp.mutex.Lock()
+	defer ftp.mutex.Unlock()
+
+	ftp.cancel() // Cancel the context, which will stop the WatchDirectory goroutine
+
+	err := ftp.Client.Close()
+	if err != nil {
+		log.Printf("Error closing FTP connection: %v", err)
+		return err
+	}
+	return nil
 }

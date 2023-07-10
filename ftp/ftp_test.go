@@ -1,122 +1,66 @@
-package ftp
+package ftp_test
 
 import (
-	"context"
-	"github.com/docker/go-connections/nat"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
-	"log"
+	"fmt"
 	"os"
 	"testing"
 	"time"
+
+	"github.com/cploutarchou/go_sync/ftp"
+	"github.com/stretchr/testify/require"
 )
 
 const (
-	ftpServerHost     = "localhost"
-	ftpServerPort     = "21"
-	ftpServerUsername = "myuser"
-	ftpServerPassword = "mypass"
-	testFilePath      = "test_file.txt"
+	ftpHost     = "127.0.0.1"
+	ftpPort     = "21"
+	ftpUser     = "myuser"
+	ftpPassword = "mypass"
 )
 
-func TestUploadFile(t *testing.T) {
-	// Initialize a new context.
-	ctx := context.Background()
-
-	// Configure and start an FTP server container.
-	req := testcontainers.ContainerRequest{
-		Image:        "fauria/vsftpd",
-		ExposedPorts: []string{"20/tcp", "21/tcp", "21100-21110/tcp"},
-		Env: map[string]string{
-			"FTP_USER":      "myuser",
-			"FTP_PASS":      "mypass",
-			"PASV_ADDRESS":  "127.0.0.1",
-			"PASV_MIN_PORT": "21100",
-			"PASV_MAX_PORT": "21110",
-		},
-		WaitingFor: wait.NewHTTPStrategy("/").WithStartupTimeout(30 * time.Second),
+func TestWatchDirectory(t *testing.T) {
+	configFTP := ftp.Config{
+		Host:     ftpHost,
+		Port:     ftpPort,
+		Username: ftpUser,
+		Password: ftpPassword,
 	}
-	ftpC, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: req,
-		Started:          true,
-	})
+	ftpClient, err := ftp.New(configFTP)
 	if err != nil {
-		log.Fatalf("Failed to start FTP container: %v", err)
+		t.Fatal("Error creating FTP client")
 	}
+	require.NotNil(t, ftpClient)
+	require.NotNil(t, ftpClient.Client)
 
-	host, err := ftpC.Host(ctx)
-	if err != nil {
-		log.Fatalf("Failed to get FTP container host: %v", err)
-	}
+	// Create a dummy directory
+	dirName := "test_dir"
+	err = os.Mkdir(dirName, 0755)
+	require.NoError(t, err)
 
-	port, err := ftpC.MappedPort(ctx, nat.Port("21"))
-	if err != nil {
-		log.Fatalf("Failed to get FTP container port: %v", err)
-	}
+	// Launch the goroutine
+	go ftpClient.WatchDirectory(dirName, "/")
 
-	defer func() {
-		if err := ftpC.Terminate(ctx); err != nil {
-			log.Fatalf("Failed to terminate FTP container: %v", err)
+	time.Sleep(2 * time.Second)
+
+	// Create multiple files in the directory
+	for i := 0; i < 10; i++ {
+		fileName := fmt.Sprintf("%s/testfile%d.txt", dirName, i)
+		f, err := os.Create(fileName)
+		// Write some text line-by-line to file
+		for j := 0; j < 10; j++ {
+			_, err = f.WriteString(fmt.Sprintf("Hello world %d\n", j))
 		}
-	}()
-
-	ftp := New(Config{
-		Host:     host,
-		Port:     port.Port(),
-		Username: "myuser",
-		Password: "mypass",
-	})
-
-	// Defer client closure
-	defer ftp.Client.Close()
-
-	localFile := "test_file.txt"
-	remoteFile := "test_file.txt"
-
-	if err := createLocalTestFile(localFile, "This is a test file content."); err != nil {
-		log.Fatalf("Failed to create local test file: %v", err)
+		require.NoError(t, err)
+		f.Close()
 	}
+	//wait for 10 seconds to upload the files
 
-	defer os.Remove(localFile)
+	time.Sleep(10 * time.Second)
 
-	ftp.uploadFile(localFile, remoteFile)
+	// Cancel the context
+	ftpClient.Close()
 
-	// Check if file was uploaded
-	files, err := ftp.Client.ReadDir("/")
-	if err != nil {
-		log.Fatalf("Error reading remote directory: %v", err)
-	}
+	// Remove the directory
+	err = os.RemoveAll(dirName)
+	require.NoError(t, err)
 
-	var uploaded bool
-	for _, file := range files {
-		if file.Name() == remoteFile {
-			uploaded = true
-		}
-	}
-
-	if !uploaded {
-		t.Fatalf("file %s was not uploaded correctly", remoteFile)
-	}
-}
-
-func createLocalTestFile(filename, content string) error {
-	file, err := os.Create(filename)
-	if err != nil {
-		return err
-	}
-
-	defer file.Close()
-
-	_, err = file.WriteString(content)
-	if err != nil {
-		return err
-	}
-
-	// Save changes to file.
-	err = file.Sync()
-	if err != nil {
-		return err
-	}
-
-	return nil
 }
