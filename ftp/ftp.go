@@ -2,6 +2,8 @@ package ftp
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -38,7 +40,7 @@ func New(config Config) (*FTP, error) {
 
 	client, err := goftp.DialConfig(cfg, config.Host+":"+config.Port)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("dial config: %w", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background()) // Create a cancelable context
@@ -46,7 +48,6 @@ func New(config Config) (*FTP, error) {
 	return &FTP{
 		Config: config,
 		Client: client,
-		mutex:  sync.Mutex{},
 		ctx:    ctx,    // Initialize with created context
 		cancel: cancel, // Initialize with created cancel function
 	}, nil
@@ -55,7 +56,7 @@ func New(config Config) (*FTP, error) {
 func (ftp *FTP) WatchDirectory(localPath string, remotePath string) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal(fmt.Errorf("create new watcher: %w", err))
 	}
 	defer watcher.Close()
 
@@ -90,7 +91,7 @@ func (ftp *FTP) WatchDirectory(localPath string, remotePath string) {
 		if info.IsDir() {
 			err = watcher.Add(path)
 			if err != nil {
-				log.Fatal(err)
+				log.Fatal(fmt.Errorf("add path to watcher: %w", err))
 			}
 		}
 
@@ -98,7 +99,7 @@ func (ftp *FTP) WatchDirectory(localPath string, remotePath string) {
 	})
 
 	if err != nil {
-		log.Println("ERROR", err)
+		logError("filepath walk", err)
 	}
 
 	<-ftp.ctx.Done()
@@ -111,7 +112,7 @@ func (ftp *FTP) uploadFile(localPath string, remotePath string) {
 	// check if remote directory exists and is empty
 	files, err := ftp.Client.ReadDir(remotePath)
 	if err != nil {
-		log.Printf("Error reading remote directory: %v", err)
+		logError("read remote directory", err)
 		return
 	}
 	if len(files) == 0 {
@@ -120,17 +121,16 @@ func (ftp *FTP) uploadFile(localPath string, remotePath string) {
 
 	file, err := os.Open(localPath)
 	if err != nil {
-		log.Printf("Error opening file: %v", err)
+		logError("open file", err)
 		return
 	}
+	defer file.Close()
 
 	remoteFilePath := filepath.Join(remotePath, filepath.Base(localPath))
 	log.Printf("Uploading %s to %s", localPath, remoteFilePath)
 	if err := ftp.Client.Store(remoteFilePath, file); err != nil {
-		log.Printf("Upload failed: %v", err)
+		logError("store file", err)
 	}
-
-	defer file.Close()
 }
 
 func (ftp *FTP) Close() error {
@@ -141,8 +141,16 @@ func (ftp *FTP) Close() error {
 
 	err := ftp.Client.Close()
 	if err != nil {
-		log.Printf("Error closing FTP connection: %v", err)
-		return err
+		logError("close FTP connection", err)
 	}
-	return nil
+	return err
 }
+
+func logError(action string, err error) {
+	if errors.Is(err, fsnotify.ErrEventOverflow) {
+		log.Printf("%s: too many changes at once: %v", action, err)
+	} else {
+		log.Printf("%s: %v", action, err)
+	}
+}
+
