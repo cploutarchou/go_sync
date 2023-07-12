@@ -14,19 +14,29 @@ import (
 	"github.com/secsy/goftp"
 )
 
+type SyncDirection int
+
+const (
+	LocalToRemote SyncDirection = iota
+	RemoteToLocal
+)
+
 type FTP struct {
 	Config
 	Client *goftp.Client
 	mutex  sync.Mutex
-	ctx    context.Context    // Context field
-	cancel context.CancelFunc // Cancel function field
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 type Config struct {
-	Host     string
-	Port     string
-	Username string
-	Password string
+	Host       string
+	Port       string
+	Username   string
+	Password   string
+	SyncDir    SyncDirection // Added SyncDir field
+	LocalPath  string        // Added LocalPath field
+	RemotePath string        // Added RemotePath field
 }
 
 func New(config Config) (*FTP, error) {
@@ -35,7 +45,7 @@ func New(config Config) (*FTP, error) {
 		Password:           config.Password,
 		ConnectionsPerHost: 10,
 		Timeout:            30 * time.Second,
-		Logger:             os.Stderr, // Logs to standard error
+		Logger:             os.Stderr,
 	}
 
 	client, err := goftp.DialConfig(cfg, config.Host+":"+config.Port)
@@ -43,14 +53,25 @@ func New(config Config) (*FTP, error) {
 		return nil, fmt.Errorf("dial config: %w", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background()) // Create a cancelable context
+	ctx, cancel := context.WithCancel(context.Background())
 
 	return &FTP{
 		Config: config,
 		Client: client,
-		ctx:    ctx,    // Initialize with created context
-		cancel: cancel, // Initialize with created cancel function
+		ctx:    ctx,
+		cancel: cancel,
 	}, nil
+}
+
+func (ftp *FTP) StartSync() {
+	switch ftp.SyncDir {
+	case LocalToRemote:
+		ftp.WatchDirectory(ftp.LocalPath, ftp.RemotePath)
+	case RemoteToLocal:
+		ftp.SyncRemoteToLocal(ftp.LocalPath, ftp.RemotePath)
+	default:
+		log.Printf("Invalid sync direction: %v", ftp.SyncDir)
+	}
 }
 
 func (ftp *FTP) WatchDirectory(localPath string, remotePath string) {
@@ -67,9 +88,7 @@ func (ftp *FTP) WatchDirectory(localPath string, remotePath string) {
 				if !ok {
 					return
 				}
-				log.Println("event:", event)
 				if event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create {
-					log.Println("modified file:", event.Name)
 					go ftp.uploadFile(event.Name, remotePath)
 				}
 			case err, ok := <-watcher.Errors:
@@ -109,7 +128,6 @@ func (ftp *FTP) uploadFile(localPath string, remotePath string) {
 	ftp.mutex.Lock()
 	defer ftp.mutex.Unlock()
 
-	// check if remote directory exists and is empty
 	files, err := ftp.Client.ReadDir(remotePath)
 	if err != nil {
 		logError("read remote directory", err)
@@ -127,9 +145,59 @@ func (ftp *FTP) uploadFile(localPath string, remotePath string) {
 	defer file.Close()
 
 	remoteFilePath := filepath.Join(remotePath, filepath.Base(localPath))
-	log.Printf("Uploading %s to %s", localPath, remoteFilePath)
 	if err := ftp.Client.Store(remoteFilePath, file); err != nil {
 		logError("store file", err)
+	}
+}
+
+func (ftp *FTP) SyncRemoteToLocal(localPath string, remotePath string) {
+	go func() {
+		for {
+			select {
+			case <-time.After(1 * time.Minute):
+				err := ftp.downloadUpdatedFiles(localPath, remotePath)
+				if err != nil {
+					logError("sync remote to local", err)
+				}
+			case <-ftp.ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+func (ftp *FTP) downloadUpdatedFiles(localPath string, remotePath string) error {
+	ftp.mutex.Lock()
+	defer ftp.mutex.Unlock()
+
+	remoteFiles, err := ftp.Client.ReadDir(remotePath)
+	if err != nil {
+		return fmt.Errorf("read remote directory: %w", err)
+	}
+
+	for _, file := range remoteFiles {
+		remoteFilePath := filepath.Join(remotePath, file.Name())
+		localFilePath := filepath.Join(localPath, file.Name())
+
+		localFileStat, err := os.Stat(localFilePath)
+		if os.IsNotExist(err) || localFileStat.ModTime().Before(file.ModTime()) {
+			ftp.downloadFile(localFilePath, remoteFilePath)
+		}
+	}
+
+	return nil
+}
+
+func (ftp *FTP) downloadFile(localPath string, remotePath string) {
+	file, err := os.Create(localPath)
+	if err != nil {
+		logError("create local file", err)
+		return
+	}
+	defer file.Close()
+
+	if err := ftp.Client.Retrieve(remotePath, file); err != nil {
+		logError("retrieve file", err)
 	}
 }
 
@@ -137,7 +205,7 @@ func (ftp *FTP) Close() error {
 	ftp.mutex.Lock()
 	defer ftp.mutex.Unlock()
 
-	ftp.cancel() // Cancel the context, which will stop the WatchDirectory goroutine
+	ftp.cancel()
 
 	err := ftp.Client.Close()
 	if err != nil {
@@ -153,4 +221,3 @@ func logError(action string, err error) {
 		log.Printf("%s: %v", action, err)
 	}
 }
-
