@@ -8,25 +8,37 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
 
+type SyncDirection int
+
+const (
+	LocalToRemote SyncDirection = iota
+	RemoteToLocal
+)
+
 type Config struct {
-	Host     string
-	Port     string
-	Username string
-	Password string
+	Host         string
+	Port         string
+	Username     string
+	Password     string
+	SyncDir      SyncDirection
+	LocalPath    string
+	RemotePath   string
+	SyncInterval time.Duration
 }
 
 type SFTP struct {
 	Config
 	Client *sftp.Client
 	mutex  sync.Mutex
-	ctx    context.Context    // Context field
-	cancel context.CancelFunc // Cancel function field
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 func NewSFTP(config Config) (*SFTP, error) {
@@ -34,6 +46,7 @@ func NewSFTP(config Config) (*SFTP, error) {
 		User:            config.Username,
 		Auth:            []ssh.AuthMethod{ssh.Password(config.Password)},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         30 * time.Second,
 	}
 
 	client, err := ssh.Dial("tcp", config.Host+":"+config.Port, sshConfig)
@@ -46,20 +59,28 @@ func NewSFTP(config Config) (*SFTP, error) {
 		return nil, fmt.Errorf("new sftp client: %w", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background()) // Create a cancelable context
+	ctx, cancel := context.WithCancel(context.Background())
 
 	return &SFTP{
 		Config: config,
 		Client: sftpClient,
-		ctx:    ctx,    // Initialize with created context
-		cancel: cancel, // Initialize with created cancel function
+		ctx:    ctx,
+		cancel: cancel,
 	}, nil
 }
 
-func (sftp *SFTP) WatchDirectory(localPath string, remotePath string) {
+func (sftp *SFTP) StartSync() {
+	if sftp.SyncDir == LocalToRemote {
+		go sftp.syncLocalToRemote()
+	} else {
+		go sftp.SyncRemoteToLocal(sftp.SyncInterval)
+	}
+}
+
+func (sftp *SFTP) syncLocalToRemote() {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		log.Fatal(fmt.Errorf("create new watcher: %w", err))
+		log.Fatal(err)
 	}
 	defer watcher.Close()
 
@@ -70,10 +91,8 @@ func (sftp *SFTP) WatchDirectory(localPath string, remotePath string) {
 				if !ok {
 					return
 				}
-				log.Println("event:", event)
 				if event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create {
-					log.Println("modified file:", event.Name)
-					go sftp.uploadFile(event.Name, remotePath)
+					go sftp.uploadFile(event.Name, sftp.RemotePath)
 				}
 			case err, ok := <-watcher.Errors:
 				if !ok {
@@ -86,26 +105,79 @@ func (sftp *SFTP) WatchDirectory(localPath string, remotePath string) {
 		}
 	}()
 
-	err = filepath.Walk(localPath, func(path string, info os.FileInfo, err error) error {
+	err = filepath.Walk(sftp.LocalPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-
 		if info.IsDir() {
 			err = watcher.Add(path)
 			if err != nil {
-				log.Fatal(fmt.Errorf("add path to watcher: %w", err))
+				return err
 			}
 		}
-
 		return nil
 	})
 
 	if err != nil {
-		log.Println("ERROR during file walk: ", err)
+		log.Fatal(err)
 	}
 
 	<-sftp.ctx.Done()
+}
+
+func (sftp *SFTP) SyncRemoteToLocal(syncInterval time.Duration) {
+	go func() {
+		for {
+			select {
+			case <-time.After(syncInterval):
+				err := sftp.downloadUpdatedFiles(sftp.LocalPath, sftp.RemotePath)
+				if err != nil {
+					log.Println("sync remote to local: ", err)
+				}
+			case <-sftp.ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+func (sftp *SFTP) downloadUpdatedFiles(localPath string, remotePath string) error {
+	sftp.mutex.Lock()
+	defer sftp.mutex.Unlock()
+
+	files, err := sftp.Client.ReadDir(remotePath)
+	if err != nil {
+		return fmt.Errorf("read remote directory: %w", err)
+	}
+
+	for _, file := range files {
+		remoteFilePath := filepath.Join(remotePath, file.Name())
+		localFilePath := filepath.Join(localPath, file.Name())
+
+		remoteFile, err := sftp.Client.Open(remoteFilePath)
+		if err != nil {
+			log.Println("ERROR opening remote file: ", err)
+			continue
+		}
+
+		localFile, err := os.Create(localFilePath)
+		if err != nil {
+			log.Println("ERROR creating local file: ", err)
+			continue
+		}
+
+		_, err = io.Copy(localFile, remoteFile)
+		if err != nil {
+			log.Println("ERROR copying file contents: ", err)
+		}
+
+		remoteFile.Close()
+		localFile.Close()
+
+		log.Printf("Downloaded %s to %s", remoteFilePath, localFilePath)
+	}
+
+	return nil
 }
 
 func (sftp *SFTP) uploadFile(localPath string, remotePath string) {
@@ -139,7 +211,7 @@ func (sftp *SFTP) Close() error {
 	sftp.mutex.Lock()
 	defer sftp.mutex.Unlock()
 
-	sftp.cancel() // Cancel the context
+	sftp.cancel()
 
 	if err := sftp.Client.Close(); err != nil {
 		log.Println("ERROR closing SFTP connection: ", err)
