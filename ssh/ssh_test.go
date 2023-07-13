@@ -1,62 +1,61 @@
-package ssh_test
+package ssh
 
 import (
-	"fmt"
-	"os"
 	"testing"
 	"time"
 
-	"github.com/cploutarchou/go_sync/ssh"
 	"github.com/stretchr/testify/require"
 )
 
 const (
-	sshHost     = "127.0.0.1"
+	sshHost     = "localhost"
 	sshPort     = "2222"
 	sshUser     = "foo"
 	sshPassword = "pass"
+	localPath   = "/tmp/localDir"
+	remotePath  = "/home/foo/upload"
 )
 
-func TestWatchDirectory(t *testing.T) {
-	configSSH := ssh.Config{
-		Host:     sshHost,
-		Port:     sshPort,
-		Username: sshUser,
-		Password: sshPassword,
+func TestNewSyncSSH(t *testing.T) {
+	configSSH := Config{
+		Host:         sshHost,
+		Port:         sshPort,
+		Username:     sshUser,
+		Password:     sshPassword,
+		SyncDir:      LocalToRemote,
+		LocalPath:    localPath,
+		RemotePath:   remotePath,
+		SyncInterval: 1 * time.Second,
 	}
-	sshClient, err := ssh.NewSSH(configSSH)
+	sshSync, err := NewSyncSSH(configSSH)
 	require.NoError(t, err)
-	require.NotNil(t, sshClient)
-	require.NotNil(t, sshClient.Client)
+	require.NotNil(t, sshSync)
+	require.NotNil(t, sshSync.Client)
 
-	// Create a dummy directory
-	dirName := "test_dir"
-	err = os.Mkdir(dirName, 0755)
+	err = sshSync.Close()
 	require.NoError(t, err)
+}
 
-	// Launch the goroutine
-	go sshClient.WatchDirectory(dirName, "/home/foo/upload")
+func TestSyncSSH_StartSyncAndClose(t *testing.T) {
+	configSSH := Config{
+		Host:         sshHost,
+		Port:         sshPort,
+		Username:     sshUser,
+		Password:     sshPassword,
+		SyncDir:      LocalToRemote,
+		LocalPath:    localPath,
+		RemotePath:   remotePath,
+		SyncInterval: 1 * time.Second,
+	}
+	sshSync, err := NewSyncSSH(configSSH)
+	require.NoError(t, err)
+	require.NotNil(t, sshSync)
+	require.NotNil(t, sshSync.Client)
+
+	sshSync.StartSync()
+
 	time.Sleep(2 * time.Second)
 
-	// Create multiple files in the directory
-	for i := 0; i < 10; i++ {
-		fileName := fmt.Sprintf("%s/testfile%d.txt", dirName, i)
-		f, err := os.Create(fileName)
-		// Write some text line-by-line to file
-		for j := 0; j < 10; j++ {
-			_, err = f.WriteString(fmt.Sprintf("Hello world %d\n", j))
-		}
-		require.NoError(t, err)
-		f.Close()
-	}
-	//wait for 10 seconds to upload the files
-	time.Sleep(10 * time.Second)
-
-	// Cancel the context
-	err = sshClient.Close()
-	require.NoError(t, err)
-
-	// Remove the directory
-	err = os.RemoveAll(dirName)
+	err = sshSync.Close()
 	require.NoError(t, err)
 }

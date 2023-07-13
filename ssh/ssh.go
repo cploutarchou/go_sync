@@ -229,13 +229,14 @@ func (s *SyncSSH) downloadFile(reader io.Reader, localPath string, filesize int)
 	return nil
 }
 
-func (s *SyncSSH) Close() {
+func (s *SyncSSH) Close() error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
 	s.cancel()
 
 	if err := s.Client.Close(); err != nil {
-		log.Println("ERROR closing SSH connection: ", err)
+		return err
 	}
+	return nil
 }

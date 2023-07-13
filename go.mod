@@ -3,6 +3,7 @@ module github.com/cploutarchou/syncpkg
 go 1.20
 
 require (
+	github.com/cploutarchou/go_sync v0.0.0-20230712194305-be96858ed4d1
 	github.com/fsnotify/fsnotify v1.6.0
 	github.com/pkg/sftp v1.13.5
 	github.com/secsy/goftp v0.0.0-20200609142545-aa2de14babf4
