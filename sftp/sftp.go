@@ -71,13 +71,13 @@ func NewSFTP(config Config) (*SFTP, error) {
 
 func (sftp *SFTP) StartSync() {
 	if sftp.SyncDir == LocalToRemote {
-		go sftp.syncLocalToRemote()
+		go sftp.SyncLocalToRemote()
 	} else {
 		go sftp.SyncRemoteToLocal(sftp.SyncInterval)
 	}
 }
 
-func (sftp *SFTP) syncLocalToRemote() {
+func (sftp *SFTP) SyncLocalToRemote() {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		log.Fatal(err)
