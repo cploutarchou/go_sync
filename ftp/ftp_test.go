@@ -1,66 +1,137 @@
-package ftp_test
+package ftp
 
 import (
-	"fmt"
+	"log"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/cploutarchou/go_sync/ftp"
-	"github.com/stretchr/testify/require"
+	"github.com/ory/dockertest"
 )
 
-const (
-	ftpHost     = "127.0.0.1"
-	ftpPort     = "21"
-	ftpUser     = "myuser"
-	ftpPassword = "mypass"
-)
-
-func TestWatchDirectory(t *testing.T) {
-	configFTP := ftp.Config{
-		Host:     ftpHost,
-		Port:     ftpPort,
-		Username: ftpUser,
-		Password: ftpPassword,
-	}
-	ftpClient, err := ftp.New(configFTP)
+func setupFtpServer(t *testing.T) (string, *dockertest.Resource) {
+	log.Println("Setting up FTP server...")
+	pool, err := dockertest.NewPool("")
 	if err != nil {
-		t.Fatal("Error creating FTP client")
+		t.Fatalf("Could not connect to docker: %s", err)
 	}
-	require.NotNil(t, ftpClient)
-	require.NotNil(t, ftpClient.Client)
 
-	// Create a dummy directory
-	dirName := "test_dir"
-	err = os.Mkdir(dirName, 0755)
-	require.NoError(t, err)
+	resource, err := pool.Run("stilliard/pure-ftpd", "latest", []string{"FTP_USER_NAME=foo", "FTP_USER_PASS=pass", "FTP_USER_HOME=/home/foo"})
+	if err != nil {
+		t.Fatalf("Could not start resource: %s", err)
+	}
 
-	// Launch the goroutine
-	go ftpClient.WatchDirectory(dirName, "/")
-
-	time.Sleep(2 * time.Second)
-
-	// Create multiple files in the directory
-	for i := 0; i < 10; i++ {
-		fileName := fmt.Sprintf("%s/testfile%d.txt", dirName, i)
-		f, err := os.Create(fileName)
-		// Write some text line-by-line to file
-		for j := 0; j < 10; j++ {
-			_, err = f.WriteString(fmt.Sprintf("Hello world %d\n", j))
+	address := "localhost:"
+	if err = pool.Retry(func() error {
+		log.Println("Attempting to connect to FTP server...")
+		ftp, err := Connect(address, 21, LocalToRemote, &ExtraConfig{
+			Username: "foo",
+			Password: "pass",
+		})
+		if err != nil {
+			return err
 		}
-		require.NoError(t, err)
-		f.Close()
-	}
-	//wait for 10 seconds to upload the files
 
+		defer ftp.conn.Close()
+		return nil
+	}); err != nil {
+		t.Fatalf("Could not connect to docker: %s", err)
+	}
+
+	log.Println("FTP server started")
+	return address, resource
+}
+
+func teardownFtpServer(t *testing.T, resource *dockertest.Resource) {
+	log.Println("Tearing down FTP server...")
+	if err := resource.Close(); err != nil {
+		t.Fatalf("Could not stop resource: %s", err)
+	}
+}
+
+func TestLogin(t *testing.T) {
+	log.Println("Running TestLogin...")
+	address, resource := setupFtpServer(t)
+	defer teardownFtpServer(t, resource)
 	time.Sleep(10 * time.Second)
 
-	// Cancel the context
-	ftpClient.Close()
+	log.Printf("Connecting to FTP server at address %s...\n", address)
+	ftp, err := Connect(address, 21, LocalToRemote, &ExtraConfig{
+		Username: "foo",
+		Password: "pass",
+	})
 
-	// Remove the directory
-	err = os.RemoveAll(dirName)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("Connect returned an error: %v", err)
+	}
+
+	if ftp == nil {
+		t.Fatalf("Connect returned nil FTP")
+	}
+
+	log.Println("TestLogin completed successfully.")
+}
+
+func TestWatchDirectory(t *testing.T) {
+	log.Println("Running TestWatchDirectory...")
+	address, resource := setupFtpServer(t)
+	defer teardownFtpServer(t, resource)
+
+	conf := &ExtraConfig{
+		Username:   "foo",
+		Password:   "pass",
+		Retries:    3,
+		MaxRetries: 3,
+		RemoteDir:  "/home/foo/upload",
+		LocalDir:   "./tmp",
+	}
+
+	log.Printf("Connecting to FTP server at address %s...\n", address)
+	ftpClient, err := Connect(address, 21, LocalToRemote, conf)
+	if err != nil {
+		t.Fatalf("Connect returned an error: %v", err)
+	}
+
+	if ftpClient == nil {
+		t.Fatalf("Connect returned nil FTP")
+	}
+
+	dirToWatch := "./tmp"
+	os.MkdirAll(dirToWatch, os.ModePerm)
+	log.Printf("Created directory to watch: %s\n", dirToWatch)
+
+	go ftpClient.WatchDirectory()
+
+	time.Sleep(20 * time.Second)
+
+	fileName := "test.txt"
+	filePath := filepath.Join(dirToWatch, fileName)
+
+	log.Printf("Creating file: %s\n", filePath)
+	file, err := os.Create(filePath)
+	if err != nil {
+		t.Fatalf("Failed to create file: %v", err)
+	}
+	file.WriteString("test")
+	file.Close()
+	log.Println("File created and closed.")
+
+	time.Sleep(1 * time.Second)
+
+	remoteFilePath := filepath.Join(conf.RemoteDir, fileName)
+	log.Printf("Checking remote file status for: %s\n", remoteFilePath)
+	_, err = ftpClient.Stat(remoteFilePath)
+	if err != nil {
+		t.Fatalf("Failed to stat file: %v", err)
+	}
+
+	log.Printf("Removing directory: %s\n", dirToWatch)
+	os.RemoveAll(dirToWatch)
+	log.Println("Directory removed.")
+
+	time.Sleep(1 * time.Second)
+
+	log.Println("TestWatchDirectory completed successfully.")
 
 }
