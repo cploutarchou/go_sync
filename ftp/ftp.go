@@ -3,6 +3,7 @@ package ftp
 import (
 	"bufio"
 	"fmt"
+	"github.com/fsnotify/fsnotify"
 	"io"
 	"log"
 	"net"
@@ -10,8 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-
-	"github.com/fsnotify/fsnotify"
 )
 
 type SyncDirection int

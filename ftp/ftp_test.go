@@ -1,13 +1,12 @@
 package ftp
 
 import (
+	"github.com/ory/dockertest"
 	"log"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
-
-	"github.com/ory/dockertest"
 )
 
 func setupFtpServer(t *testing.T) (string, *dockertest.Resource) {
@@ -133,5 +132,4 @@ func TestWatchDirectory(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	log.Println("TestWatchDirectory completed successfully.")
-
 }
