@@ -3,7 +3,6 @@ package ftp
 import (
 	"bufio"
 	"fmt"
-	"github.com/fsnotify/fsnotify"
 	"io"
 	"log"
 	"net"
@@ -11,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 type SyncDirection int
@@ -38,9 +39,6 @@ type ExtraConfig struct {
 }
 
 func Connect(address string, port int, direction SyncDirection, config *ExtraConfig) (*FTP, error) {
-	if port == 0 {
-		return nil, fmt.Errorf("port cannot be 0")
-	}
 	address = net.JoinHostPort(address, fmt.Sprintf("%d", port))
 	conn, err := net.Dial("tcp", address)
 	if err != nil {
@@ -62,7 +60,6 @@ func Connect(address string, port int, direction SyncDirection, config *ExtraCon
 		_ = ftp.conn.Close()
 		return nil, err
 	}
-
 	return ftp, nil
 }
 
