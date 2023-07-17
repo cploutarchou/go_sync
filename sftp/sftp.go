@@ -87,9 +87,8 @@ func ConnectSSHPair(address string, port int, direction SyncDirection, config *E
 	authMethod := ssh.PublicKeys(signer)
 
 	clientConfig := &ssh.ClientConfig{
-		User:            config.Username,
-		Auth:            []ssh.AuthMethod{authMethod},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		User: config.Username,
+		Auth: []ssh.AuthMethod{authMethod},
 	}
 
 	conn, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", address, port), clientConfig)
