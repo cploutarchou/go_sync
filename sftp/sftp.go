@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/user"
 	"path/filepath"
 	"sync"
 
@@ -69,12 +70,12 @@ func Connect(address string, port int, direction SyncDirection, config *ExtraCon
 }
 
 func ConnectSSHPair(address string, port int, direction SyncDirection, config *ExtraConfig) (*SFTP, error) {
-	homeDir, err := os.UserHomeDir()
+	usr, err := user.Current()
 	if err != nil {
 		return nil, fmt.Errorf("cannot get user home directory: %v", err)
 	}
 
-	key, err := os.ReadFile(filepath.Join(homeDir, ".ssh", "id_rsa"))
+	key, err := os.ReadFile(filepath.Join(usr.HomeDir, ".ssh", "id_rsa"))
 	if err != nil {
 		return nil, fmt.Errorf("unable to read private key: %v", err)
 	}
@@ -87,8 +88,9 @@ func ConnectSSHPair(address string, port int, direction SyncDirection, config *E
 	authMethod := ssh.PublicKeys(signer)
 
 	clientConfig := &ssh.ClientConfig{
-		User: config.Username,
-		Auth: []ssh.AuthMethod{authMethod},
+		User:            config.Username,
+		Auth:            []ssh.AuthMethod{authMethod},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
 
 	conn, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", address, port), clientConfig)
@@ -107,7 +109,6 @@ func ConnectSSHPair(address string, port int, direction SyncDirection, config *E
 		config:    config,
 	}, nil
 }
-
 func (c *SFTP) WatchDirectory() {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
