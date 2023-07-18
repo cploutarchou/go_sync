@@ -126,9 +126,6 @@ func (c *SFTP) WatchDirectory() {
 	go func() {
 		for {
 			select {
-			case <-c.ctx.Done():
-				log.Println("Stopping directory watch due to context cancellation.")
-				return
 			case event, ok := <-watcher.Events:
 				if !ok {
 					return
@@ -145,6 +142,21 @@ func (c *SFTP) WatchDirectory() {
 						err := c.downloadFile(event.Name)
 						if err != nil {
 							log.Println("Error downloading file:", err)
+						}
+					}
+				}
+				if event.Op&fsnotify.Remove == fsnotify.Remove {
+					log.Println("Deleted file:", event.Name)
+					if c.Direction == LocalToRemote {
+						err := c.RemoveRemoteFile(event.Name)
+						if err != nil {
+							log.Println("Error removing remote file:", err)
+						}
+					}
+					if c.Direction == RemoteToLocal {
+						err := c.RemoveLocalFile(event.Name)
+						if err != nil {
+							log.Println("Error removing local file:", err)
 						}
 					}
 				}
@@ -239,5 +251,20 @@ func (c *SFTP) Mkdir(dir string) error {
 	defer c.Unlock()
 
 	err := c.Client.Mkdir(filepath.Join(c.config.RemoteDir, dir))
+	return err
+}
+func (c *SFTP) RemoveRemoteFile(remotePath string) error {
+	c.Lock()
+	defer c.Unlock()
+
+	err := c.Client.Remove(remotePath)
+	return err
+}
+
+func (c *SFTP) RemoveLocalFile(localPath string) error {
+	c.Lock()
+	defer c.Unlock()
+
+	err := os.Remove(localPath)
 	return err
 }
