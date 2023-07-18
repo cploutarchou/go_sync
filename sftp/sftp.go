@@ -1,6 +1,7 @@
 package sftp
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -27,6 +28,7 @@ type SFTP struct {
 	Direction SyncDirection
 	config    *ExtraConfig
 	Watcher   *fsnotify.Watcher
+	ctx       context.Context
 }
 
 type ExtraConfig struct {
@@ -115,7 +117,7 @@ func (c *SFTP) WatchDirectory() {
 		log.Fatal(err)
 	}
 	defer func(watcher *fsnotify.Watcher) {
-		err := watcher.Close()
+		err = watcher.Close()
 		if err != nil {
 			log.Println("Error closing watcher:", err)
 		}
@@ -124,6 +126,9 @@ func (c *SFTP) WatchDirectory() {
 	go func() {
 		for {
 			select {
+			case <-c.ctx.Done():
+				log.Println("Stopping directory watch due to context cancellation.")
+				return
 			case event, ok := <-watcher.Events:
 				if !ok {
 					return
@@ -157,7 +162,8 @@ func (c *SFTP) WatchDirectory() {
 		log.Fatal(err)
 	}
 
-	<-make(chan struct{})
+	<-c.ctx.Done()
+	log.Println("Directory watch ended.")
 }
 
 func (c *SFTP) uploadFile(filePath string) error {
@@ -169,7 +175,7 @@ func (c *SFTP) uploadFile(filePath string) error {
 		return err
 	}
 	defer func(srcFile *os.File) {
-		err := srcFile.Close()
+		err = srcFile.Close()
 		if err != nil {
 			log.Println("Error closing file:", err)
 		}
@@ -180,11 +186,15 @@ func (c *SFTP) uploadFile(filePath string) error {
 		return err
 	}
 	defer func(dstFile *sftp.File) {
-		err := dstFile.Close()
+		err = dstFile.Close()
 		if err != nil {
 			log.Println("Error closing file:", err)
 		}
 	}(dstFile)
+
+	if c.ctx.Err() != nil {
+		return c.ctx.Err()
+	}
 
 	_, err = io.Copy(dstFile, srcFile)
 	return err
@@ -199,7 +209,7 @@ func (c *SFTP) downloadFile(remotePath string) error {
 		return err
 	}
 	defer func(srcFile *sftp.File) {
-		err := srcFile.Close()
+		err = srcFile.Close()
 		if err != nil {
 			log.Println("Error closing file:", err)
 		}
@@ -210,11 +220,15 @@ func (c *SFTP) downloadFile(remotePath string) error {
 		return err
 	}
 	defer func(dstFile *os.File) {
-		err := dstFile.Close()
+		err = dstFile.Close()
 		if err != nil {
 			log.Println("Error closing file:", err)
 		}
 	}(dstFile)
+
+	if c.ctx.Err() != nil {
+		return c.ctx.Err()
+	}
 
 	_, err = io.Copy(dstFile, srcFile)
 	return err
