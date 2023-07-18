@@ -63,16 +63,16 @@ func Connect(address string, port int, direction SyncDirection, config *ExtraCon
 	return ftp, nil
 }
 
-func (c *FTP) Login(username, password string) error {
-	c.Lock()
-	defer c.Unlock()
+func (f *FTP) Login(username, password string) error {
+	f.Lock()
+	defer f.Unlock()
 
-	_, err := c.conn.Cmd("USER %s", username)
+	_, err := f.conn.Cmd("USER %s", username)
 	if err != nil {
 		return err
 	}
 
-	_, err = c.conn.Cmd("PASS %s", password)
+	_, err = f.conn.Cmd("PASS %s", password)
 	if err != nil {
 		return err
 	}
@@ -80,21 +80,21 @@ func (c *FTP) Login(username, password string) error {
 	return nil
 }
 
-func (c *FTP) List() ([]string, error) {
-	c.Lock()
-	defer c.Unlock()
+func (f *FTP) List() ([]string, error) {
+	f.Lock()
+	defer f.Unlock()
 
-	_, err := c.conn.Cmd("PASV")
+	_, err := f.conn.Cmd("PASV")
 	if err != nil {
 		return nil, err
 	}
 
-	_, err = c.conn.Cmd("LIST")
+	_, err = f.conn.Cmd("LIST")
 	if err != nil {
 		return nil, err
 	}
 
-	reader := bufio.NewReader(c.conn.R)
+	reader := bufio.NewReader(f.conn.R)
 	line, _, err := reader.ReadLine()
 	var files []string
 	for err == nil {
@@ -104,8 +104,46 @@ func (c *FTP) List() ([]string, error) {
 
 	return files, nil
 }
+func (f *FTP) initialSync() error {
+	f.Lock()
+	defer f.Unlock()
 
-func (c *FTP) WatchDirectory() {
+	switch f.Direction {
+	case LocalToRemote:
+		localFiles, err := os.ReadDir(f.config.LocalDir)
+		if err != nil {
+			return err
+		}
+
+		for _, file := range localFiles {
+			err = f.uploadFile(filepath.Join(f.config.LocalDir, file.Name()))
+			if err != nil {
+				return err
+			}
+		}
+
+	case RemoteToLocal:
+		remoteFiles, err := f.List()
+		if err != nil {
+			return err
+		}
+
+		for _, file := range remoteFiles {
+			err = f.downloadFile(file)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (f *FTP) WatchDirectory() {
+	err := f.initialSync()
+	if err != nil {
+		log.Fatal(err)
+	}
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		log.Fatal(err)
@@ -126,14 +164,14 @@ func (c *FTP) WatchDirectory() {
 				}
 				if event.Op&fsnotify.Write == fsnotify.Write {
 					log.Println("Modified file:", event.Name)
-					if c.Direction == LocalToRemote {
-						err := c.uploadFile(event.Name)
+					if f.Direction == LocalToRemote {
+						err := f.uploadFile(event.Name)
 						if err != nil {
 							log.Println("Error uploading file:", err)
 						}
 					}
-					if c.Direction == RemoteToLocal {
-						err := c.downloadFile(event.Name)
+					if f.Direction == RemoteToLocal {
+						err := f.downloadFile(event.Name)
 						if err != nil {
 							log.Println("Error downloading file:", err)
 						}
@@ -141,14 +179,14 @@ func (c *FTP) WatchDirectory() {
 				}
 				if event.Op&fsnotify.Remove == fsnotify.Remove {
 					log.Println("Deleted file:", event.Name)
-					if c.Direction == LocalToRemote {
-						err := c.removeRemoteFile(event.Name)
+					if f.Direction == LocalToRemote {
+						err := f.removeRemoteFile(event.Name)
 						if err != nil {
 							log.Println("Error removing remote file:", err)
 						}
 					}
-					if c.Direction == RemoteToLocal {
-						err := c.removeLocalFile(event.Name)
+					if f.Direction == RemoteToLocal {
+						err := f.removeLocalFile(event.Name)
 						if err != nil {
 							log.Println("Error removing local file:", err)
 						}
@@ -163,16 +201,16 @@ func (c *FTP) WatchDirectory() {
 		}
 	}()
 
-	err = watcher.Add(c.config.LocalDir)
+	err = watcher.Add(f.config.LocalDir)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	<-make(chan struct{})
 }
-func (c *FTP) uploadFile(filePath string) error {
-	c.Lock()
-	defer c.Unlock()
+func (f *FTP) uploadFile(filePath string) error {
+	f.Lock()
+	defer f.Unlock()
 
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -185,26 +223,26 @@ func (c *FTP) uploadFile(filePath string) error {
 		}
 	}(file)
 
-	for i := 0; i < c.config.MaxRetries; i++ {
-		_, err = c.conn.Cmd("PASV")
+	for i := 0; i < f.config.MaxRetries; i++ {
+		_, err = f.conn.Cmd("PASV")
 		if err != nil {
-			if i == c.config.MaxRetries-1 {
+			if i == f.config.MaxRetries-1 {
 				return err
 			}
 			continue
 		}
 
-		_, err = c.conn.Cmd("STOR %s", filepath.Join(c.config.RemoteDir, filepath.Base(filePath)))
+		_, err = f.conn.Cmd("STOR %s", filepath.Join(f.config.RemoteDir, filepath.Base(filePath)))
 		if err != nil {
-			if i == c.config.MaxRetries-1 {
+			if i == f.config.MaxRetries-1 {
 				return err
 			}
 			continue
 		}
 
-		_, err = io.Copy(c.conn.W, file)
+		_, err = io.Copy(f.conn.W, file)
 		if err != nil {
-			if i == c.config.MaxRetries-1 {
+			if i == f.config.MaxRetries-1 {
 				return err
 			}
 			continue
@@ -216,11 +254,11 @@ func (c *FTP) uploadFile(filePath string) error {
 	return nil
 }
 
-func (c *FTP) downloadFile(name string) error {
-	c.Lock()
-	defer c.Unlock()
+func (f *FTP) downloadFile(name string) error {
+	f.Lock()
+	defer f.Unlock()
 
-	file, err := os.Create(filepath.Join(c.config.LocalDir, name))
+	file, err := os.Create(filepath.Join(f.config.LocalDir, name))
 	if err != nil {
 		return err
 	}
@@ -231,26 +269,26 @@ func (c *FTP) downloadFile(name string) error {
 		}
 	}(file)
 
-	for i := 0; i < c.config.MaxRetries; i++ {
-		_, err = c.conn.Cmd("PASV")
+	for i := 0; i < f.config.MaxRetries; i++ {
+		_, err = f.conn.Cmd("PASV")
 		if err != nil {
-			if i == c.config.MaxRetries-1 {
+			if i == f.config.MaxRetries-1 {
 				return err
 			}
 			continue
 		}
 
-		_, err = c.conn.Cmd("RETR %s", filepath.Join(c.config.RemoteDir, name))
+		_, err = f.conn.Cmd("RETR %s", filepath.Join(f.config.RemoteDir, name))
 		if err != nil {
-			if i == c.config.MaxRetries-1 {
+			if i == f.config.MaxRetries-1 {
 				return err
 			}
 			continue
 		}
 
-		_, err = io.Copy(file, c.conn.R)
+		_, err = io.Copy(file, f.conn.R)
 		if err != nil {
-			if i == c.config.MaxRetries-1 {
+			if i == f.config.MaxRetries-1 {
 				return err
 			}
 			continue
@@ -262,21 +300,21 @@ func (c *FTP) downloadFile(name string) error {
 	return nil
 }
 
-func (c *FTP) Stat(path string) (string, error) {
-	c.Lock()
-	defer c.Unlock()
+func (f *FTP) Stat(path string) (string, error) {
+	f.Lock()
+	defer f.Unlock()
 
-	_, err := c.conn.Cmd("PASV")
+	_, err := f.conn.Cmd("PASV")
 	if err != nil {
 		return "", err
 	}
 
-	_, err = c.conn.Cmd("LIST %s", path)
+	_, err = f.conn.Cmd("LIST %s", path)
 	if err != nil {
 		return "", err
 	}
 
-	reader := bufio.NewReader(c.conn.R)
+	reader := bufio.NewReader(f.conn.R)
 	line, _, err := reader.ReadLine()
 	if err != nil && err != io.EOF {
 		return "", err
@@ -285,11 +323,11 @@ func (c *FTP) Stat(path string) (string, error) {
 	return string(line), nil
 }
 
-func (c *FTP) Mkdir(dir string) error {
-	c.Lock()
-	defer c.Unlock()
+func (f *FTP) Mkdir(dir string) error {
+	f.Lock()
+	defer f.Unlock()
 
-	_, err := c.conn.Cmd("MKD %s", dir)
+	_, err := f.conn.Cmd("MKD %s", dir)
 	if err != nil {
 		return err
 	}
@@ -297,11 +335,11 @@ func (c *FTP) Mkdir(dir string) error {
 	return nil
 }
 
-func (c *FTP) removeRemoteFile(filePath string) error {
-	c.Lock()
-	defer c.Unlock()
+func (f *FTP) removeRemoteFile(filePath string) error {
+	f.Lock()
+	defer f.Unlock()
 
-	_, err := c.conn.Cmd("DELE %s", filepath.Join(c.config.RemoteDir, filepath.Base(filePath)))
+	_, err := f.conn.Cmd("DELE %s", filepath.Join(f.config.RemoteDir, filepath.Base(filePath)))
 	if err != nil {
 		return err
 	}
@@ -309,9 +347,9 @@ func (c *FTP) removeRemoteFile(filePath string) error {
 	return nil
 }
 
-func (c *FTP) removeLocalFile(filePath string) error {
-	c.Lock()
-	defer c.Unlock()
+func (f *FTP) removeLocalFile(filePath string) error {
+	f.Lock()
+	defer f.Unlock()
 
 	err := os.Remove(filePath)
 	if err != nil {

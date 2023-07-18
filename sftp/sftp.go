@@ -113,7 +113,47 @@ func ConnectSSHPair(address string, port int, direction SyncDirection, config *E
 		ctx:       context.Background(),
 	}, nil
 }
-func (c *SFTP) WatchDirectory() {
+
+func (s *SFTP) initialSync() error {
+	s.Lock()
+	defer s.Unlock()
+
+	switch s.Direction {
+	case LocalToRemote:
+		localFiles, err := os.ReadDir(s.config.LocalDir)
+		if err != nil {
+			return err
+		}
+
+		for _, file := range localFiles {
+			err = s.uploadFile(filepath.Join(s.config.LocalDir, file.Name()))
+			if err != nil {
+				return err
+			}
+		}
+
+	case RemoteToLocal:
+		remoteFiles, err := s.Client.ReadDir(s.config.RemoteDir)
+		if err != nil {
+			return err
+		}
+
+		for _, file := range remoteFiles {
+			err = s.downloadFile(filepath.Join(s.config.RemoteDir, file.Name()))
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (s *SFTP) WatchDirectory() {
+	err := s.initialSync()
+	if err != nil {
+		log.Fatal(err)
+	}
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		log.Fatal(err)
@@ -134,14 +174,14 @@ func (c *SFTP) WatchDirectory() {
 				}
 				if event.Op&fsnotify.Write == fsnotify.Write {
 					log.Println("Modified file:", event.Name)
-					if c.Direction == LocalToRemote {
-						err := c.uploadFile(event.Name)
+					if s.Direction == LocalToRemote {
+						err := s.uploadFile(event.Name)
 						if err != nil {
 							log.Println("Error uploading file:", err)
 						}
 					}
-					if c.Direction == RemoteToLocal {
-						err := c.downloadFile(event.Name)
+					if s.Direction == RemoteToLocal {
+						err := s.downloadFile(event.Name)
 						if err != nil {
 							log.Println("Error downloading file:", err)
 						}
@@ -149,14 +189,14 @@ func (c *SFTP) WatchDirectory() {
 				}
 				if event.Op&fsnotify.Remove == fsnotify.Remove {
 					log.Println("Deleted file:", event.Name)
-					if c.Direction == LocalToRemote {
-						err := c.RemoveRemoteFile(event.Name)
+					if s.Direction == LocalToRemote {
+						err := s.RemoveRemoteFile(event.Name)
 						if err != nil {
 							log.Println("Error removing remote file:", err)
 						}
 					}
-					if c.Direction == RemoteToLocal {
-						err := c.RemoveLocalFile(event.Name)
+					if s.Direction == RemoteToLocal {
+						err := s.RemoveLocalFile(event.Name)
 						if err != nil {
 							log.Println("Error removing local file:", err)
 						}
@@ -171,18 +211,18 @@ func (c *SFTP) WatchDirectory() {
 		}
 	}()
 
-	err = watcher.Add(c.config.LocalDir)
+	err = watcher.Add(s.config.LocalDir)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	<-c.ctx.Done()
+	<-s.ctx.Done()
 	log.Println("Directory watch ended.")
 }
 
-func (c *SFTP) uploadFile(filePath string) error {
-	c.Lock()
-	defer c.Unlock()
+func (s *SFTP) uploadFile(filePath string) error {
+	s.Lock()
+	defer s.Unlock()
 
 	srcFile, err := os.Open(filePath)
 	if err != nil {
@@ -195,7 +235,7 @@ func (c *SFTP) uploadFile(filePath string) error {
 		}
 	}(srcFile)
 
-	dstFile, err := c.Client.Create(filepath.Join(c.config.RemoteDir, filepath.Base(filePath)))
+	dstFile, err := s.Client.Create(filepath.Join(s.config.RemoteDir, filepath.Base(filePath)))
 	if err != nil {
 		return err
 	}
@@ -206,19 +246,19 @@ func (c *SFTP) uploadFile(filePath string) error {
 		}
 	}(dstFile)
 
-	if c.ctx.Err() != nil {
-		return c.ctx.Err()
+	if s.ctx.Err() != nil {
+		return s.ctx.Err()
 	}
 
 	_, err = io.Copy(dstFile, srcFile)
 	return err
 }
 
-func (c *SFTP) downloadFile(remotePath string) error {
-	c.Lock()
-	defer c.Unlock()
+func (s *SFTP) downloadFile(remotePath string) error {
+	s.Lock()
+	defer s.Unlock()
 
-	srcFile, err := c.Client.Open(remotePath)
+	srcFile, err := s.Client.Open(remotePath)
 	if err != nil {
 		return err
 	}
@@ -229,7 +269,7 @@ func (c *SFTP) downloadFile(remotePath string) error {
 		}
 	}(srcFile)
 
-	dstFile, err := os.Create(filepath.Join(c.config.LocalDir, filepath.Base(remotePath)))
+	dstFile, err := os.Create(filepath.Join(s.config.LocalDir, filepath.Base(remotePath)))
 	if err != nil {
 		return err
 	}
@@ -240,32 +280,32 @@ func (c *SFTP) downloadFile(remotePath string) error {
 		}
 	}(dstFile)
 
-	if c.ctx.Err() != nil {
-		return c.ctx.Err()
+	if s.ctx.Err() != nil {
+		return s.ctx.Err()
 	}
 
 	_, err = io.Copy(dstFile, srcFile)
 	return err
 }
 
-func (c *SFTP) Mkdir(dir string) error {
-	c.Lock()
-	defer c.Unlock()
+func (s *SFTP) Mkdir(dir string) error {
+	s.Lock()
+	defer s.Unlock()
 
-	err := c.Client.Mkdir(filepath.Join(c.config.RemoteDir, dir))
+	err := s.Client.Mkdir(filepath.Join(s.config.RemoteDir, dir))
 	return err
 }
-func (c *SFTP) RemoveRemoteFile(remotePath string) error {
-	c.Lock()
-	defer c.Unlock()
+func (s *SFTP) RemoveRemoteFile(remotePath string) error {
+	s.Lock()
+	defer s.Unlock()
 
-	err := c.Client.Remove(remotePath)
+	err := s.Client.Remove(remotePath)
 	return err
 }
 
-func (c *SFTP) RemoveLocalFile(localPath string) error {
-	c.Lock()
-	defer c.Unlock()
+func (s *SFTP) RemoveLocalFile(localPath string) error {
+	s.Lock()
+	defer s.Unlock()
 
 	err := os.Remove(localPath)
 	return err
