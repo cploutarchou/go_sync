@@ -139,6 +139,21 @@ func (c *FTP) WatchDirectory() {
 						}
 					}
 				}
+				if event.Op&fsnotify.Remove == fsnotify.Remove {
+					log.Println("Deleted file:", event.Name)
+					if c.Direction == LocalToRemote {
+						err := c.removeRemoteFile(event.Name)
+						if err != nil {
+							log.Println("Error removing remote file:", err)
+						}
+					}
+					if c.Direction == RemoteToLocal {
+						err := c.removeLocalFile(event.Name)
+						if err != nil {
+							log.Println("Error removing local file:", err)
+						}
+					}
+				}
 			case err, ok := <-watcher.Errors:
 				if !ok {
 					return
@@ -155,7 +170,6 @@ func (c *FTP) WatchDirectory() {
 
 	<-make(chan struct{})
 }
-
 func (c *FTP) uploadFile(filePath string) error {
 	c.Lock()
 	defer c.Unlock()
@@ -276,6 +290,30 @@ func (c *FTP) Mkdir(dir string) error {
 	defer c.Unlock()
 
 	_, err := c.conn.Cmd("MKD %s", dir)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *FTP) removeRemoteFile(filePath string) error {
+	c.Lock()
+	defer c.Unlock()
+
+	_, err := c.conn.Cmd("DELE %s", filepath.Join(c.config.RemoteDir, filepath.Base(filePath)))
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *FTP) removeLocalFile(filePath string) error {
+	c.Lock()
+	defer c.Unlock()
+
+	err := os.Remove(filePath)
 	if err != nil {
 		return err
 	}
