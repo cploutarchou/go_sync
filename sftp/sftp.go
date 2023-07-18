@@ -68,6 +68,7 @@ func Connect(address string, port int, direction SyncDirection, config *ExtraCon
 		Client:    client,
 		Direction: direction,
 		config:    config,
+		ctx:       context.Background(),
 	}, nil
 }
 
@@ -109,6 +110,7 @@ func ConnectSSHPair(address string, port int, direction SyncDirection, config *E
 		Client:    client,
 		Direction: direction,
 		config:    config,
+		ctx:       context.Background(),
 	}, nil
 }
 func (c *SFTP) WatchDirectory() {
