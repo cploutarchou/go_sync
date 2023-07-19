@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
-	"sync"
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/pkg/sftp"
@@ -22,8 +21,9 @@ const (
 	RemoteToLocal
 )
 
+var logger = log.New(os.Stdout, "sftp: ", log.Lshortfile)
+
 type SFTP struct {
-	sync.Mutex
 	Client    *sftp.Client
 	Direction SyncDirection
 	config    *ExtraConfig
@@ -115,20 +115,27 @@ func ConnectSSHPair(address string, port int, direction SyncDirection, config *E
 }
 
 func (s *SFTP) initialSync() error {
-	s.Lock()
-	defer s.Unlock()
-
 	switch s.Direction {
 	case LocalToRemote:
 		localFiles, err := os.ReadDir(s.config.LocalDir)
 		if err != nil {
 			return err
 		}
-
 		for _, file := range localFiles {
-			err = s.uploadFile(filepath.Join(s.config.LocalDir, file.Name()))
-			if err != nil {
-				return err
+			if file.IsDir() {
+				err = s.checkOrCreateDir(filepath.Join(s.config.LocalDir, file.Name()))
+				if err != nil {
+					return err
+				}
+			} else {
+				remoteFilePath := filepath.Join(s.config.RemoteDir, file.Name())
+				_, err := s.Client.Stat(remoteFilePath)
+				if err != nil {
+					err = s.uploadFile(filepath.Join(s.config.LocalDir, file.Name()))
+					if err != nil {
+						return err
+					}
+				}
 			}
 		}
 
@@ -139,9 +146,20 @@ func (s *SFTP) initialSync() error {
 		}
 
 		for _, file := range remoteFiles {
-			err = s.downloadFile(filepath.Join(s.config.RemoteDir, file.Name()))
-			if err != nil {
-				return err
+			if file.IsDir() {
+				err = s.checkOrCreateDir(filepath.Join(s.config.RemoteDir, file.Name()))
+				if err != nil {
+					return err
+				}
+			} else {
+				localFilePath := filepath.Join(s.config.LocalDir, file.Name())
+				_, err := os.Stat(localFilePath)
+				if err != nil {
+					err = s.downloadFile(filepath.Join(s.config.RemoteDir, file.Name()))
+					if err != nil {
+						return err
+					}
+				}
 			}
 		}
 	}
@@ -149,19 +167,36 @@ func (s *SFTP) initialSync() error {
 	return nil
 }
 
+func (s *SFTP) checkOrCreateDir(path string) error {
+	// This checks the existence of a directory, creates it if doesn't exist
+	// It also recursively checks and creates subdirectories
+	_, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		errDir := os.MkdirAll(path, 0755)
+		if errDir != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *SFTP) WatchDirectory() {
+	logger.Println("Starting initial sync...")
 	err := s.initialSync()
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatal(err)
 	}
+	logger.Println("Initial sync done.")
+
+	logger.Println("Setting up watcher...")
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatal(err)
 	}
 	defer func(watcher *fsnotify.Watcher) {
 		err = watcher.Close()
 		if err != nil {
-			log.Println("Error closing watcher:", err)
+			logger.Println("Error closing watcher:", err)
 		}
 	}(watcher)
 
@@ -172,33 +207,48 @@ func (s *SFTP) WatchDirectory() {
 				if !ok {
 					return
 				}
+				logger.Println("Received event:", event)
+
+				// Add new directories to the watcher
+				if event.Op&fsnotify.Create == fsnotify.Create {
+					info, err := os.Stat(event.Name)
+					if err == nil && info.IsDir() {
+						err = watcher.Add(event.Name)
+						if err != nil {
+							logger.Println("Error adding directory to watcher:", err)
+						} else {
+							logger.Println("Adding new directory to watcher:", event.Name)
+						}
+					}
+				}
+
 				if event.Op&fsnotify.Write == fsnotify.Write {
-					log.Println("Modified file:", event.Name)
+					logger.Println("Modified file:", event.Name)
 					if s.Direction == LocalToRemote {
 						err := s.uploadFile(event.Name)
 						if err != nil {
-							log.Println("Error uploading file:", err)
+							logger.Println("Error uploading file:", err)
 						}
 					}
 					if s.Direction == RemoteToLocal {
 						err := s.downloadFile(event.Name)
 						if err != nil {
-							log.Println("Error downloading file:", err)
+							logger.Println("Error downloading file:", err)
 						}
 					}
 				}
 				if event.Op&fsnotify.Remove == fsnotify.Remove {
-					log.Println("Deleted file:", event.Name)
+					logger.Println("Deleted file:", event.Name)
 					if s.Direction == LocalToRemote {
 						err := s.RemoveRemoteFile(event.Name)
 						if err != nil {
-							log.Println("Error removing remote file:", err)
+							logger.Println("Error removing remote file:", err)
 						}
 					}
 					if s.Direction == RemoteToLocal {
 						err := s.RemoveLocalFile(event.Name)
 						if err != nil {
-							log.Println("Error removing local file:", err)
+							logger.Println("Error removing local file:", err)
 						}
 					}
 				}
@@ -206,23 +256,38 @@ func (s *SFTP) WatchDirectory() {
 				if !ok {
 					return
 				}
-				log.Println("Error:", err)
+				logger.Println("Error:", err)
 			}
 		}
 	}()
 
-	err = watcher.Add(s.config.LocalDir)
+	// Add root directory and all subdirectories to the watcher
+	err = s.AddDirectoriesToWatcher(watcher, s.config.LocalDir)
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatal(err)
 	}
 
 	<-s.ctx.Done()
-	log.Println("Directory watch ended.")
+	logger.Println("Directory watch ended.")
 }
 
+func (s *SFTP) AddDirectoriesToWatcher(watcher *fsnotify.Watcher, rootDir string) error {
+	return filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
+		if info.IsDir() {
+			err = watcher.Add(path)
+			if err != nil {
+				return err
+			}
+			logger.Println("Adding watcher to directory:", path)
+		}
+		return nil
+	})
+}
 func (s *SFTP) uploadFile(filePath string) error {
-	s.Lock()
-	defer s.Unlock()
+	relativePath, err := filepath.Rel(s.config.LocalDir, filePath)
+	if err != nil {
+		return err
+	}
 
 	srcFile, err := os.Open(filePath)
 	if err != nil {
@@ -231,18 +296,18 @@ func (s *SFTP) uploadFile(filePath string) error {
 	defer func(srcFile *os.File) {
 		err = srcFile.Close()
 		if err != nil {
-			log.Println("Error closing file:", err)
+			logger.Println("Error closing file:", err)
 		}
 	}(srcFile)
 
-	dstFile, err := s.Client.Create(filepath.Join(s.config.RemoteDir, filepath.Base(filePath)))
+	dstFile, err := s.Client.Create(filepath.Join(s.config.RemoteDir, relativePath))
 	if err != nil {
 		return err
 	}
 	defer func(dstFile *sftp.File) {
 		err = dstFile.Close()
 		if err != nil {
-			log.Println("Error closing file:", err)
+			logger.Println("Error closing file:", err)
 		}
 	}(dstFile)
 
@@ -255,8 +320,10 @@ func (s *SFTP) uploadFile(filePath string) error {
 }
 
 func (s *SFTP) downloadFile(remotePath string) error {
-	s.Lock()
-	defer s.Unlock()
+	relativePath, err := filepath.Rel(s.config.RemoteDir, remotePath)
+	if err != nil {
+		return err
+	}
 
 	srcFile, err := s.Client.Open(remotePath)
 	if err != nil {
@@ -265,18 +332,18 @@ func (s *SFTP) downloadFile(remotePath string) error {
 	defer func(srcFile *sftp.File) {
 		err = srcFile.Close()
 		if err != nil {
-			log.Println("Error closing file:", err)
+			logger.Println("Error closing file:", err)
 		}
 	}(srcFile)
 
-	dstFile, err := os.Create(filepath.Join(s.config.LocalDir, filepath.Base(remotePath)))
+	dstFile, err := os.Create(filepath.Join(s.config.LocalDir, relativePath))
 	if err != nil {
 		return err
 	}
 	defer func(dstFile *os.File) {
 		err = dstFile.Close()
 		if err != nil {
-			log.Println("Error closing file:", err)
+			logger.Println("Error closing file:", err)
 		}
 	}(dstFile)
 
@@ -289,23 +356,17 @@ func (s *SFTP) downloadFile(remotePath string) error {
 }
 
 func (s *SFTP) Mkdir(dir string) error {
-	s.Lock()
-	defer s.Unlock()
 
 	err := s.Client.Mkdir(filepath.Join(s.config.RemoteDir, dir))
 	return err
 }
 func (s *SFTP) RemoveRemoteFile(remotePath string) error {
-	s.Lock()
-	defer s.Unlock()
 
 	err := s.Client.Remove(remotePath)
 	return err
 }
 
 func (s *SFTP) RemoveLocalFile(localPath string) error {
-	s.Lock()
-	defer s.Unlock()
 
 	err := os.Remove(localPath)
 	return err
