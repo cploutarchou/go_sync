@@ -8,11 +8,14 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"sync"
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
+
+
 
 type SyncDirection int
 
@@ -24,11 +27,12 @@ const (
 var logger = log.New(os.Stdout, "sftp: ", log.Lshortfile)
 
 type SFTP struct {
-	Client    *sftp.Client
 	Direction SyncDirection
 	config    *ExtraConfig
 	Watcher   *fsnotify.Watcher
 	ctx       context.Context
+	mu        sync.Mutex
+	Client    *sftp.Client
 }
 
 type ExtraConfig struct {
@@ -75,17 +79,17 @@ func Connect(address string, port int, direction SyncDirection, config *ExtraCon
 func ConnectSSHPair(address string, port int, direction SyncDirection, config *ExtraConfig) (*SFTP, error) {
 	usr, err := user.Current()
 	if err != nil {
-		return nil, fmt.Errorf("cannot get user home directory: %v", err)
+		return nil, fmt.Errorf("cannot get user home directory: %w", err)
 	}
 
 	key, err := os.ReadFile(filepath.Join(usr.HomeDir, ".ssh", "id_rsa"))
 	if err != nil {
-		return nil, fmt.Errorf("unable to read private key: %v", err)
+		return nil, fmt.Errorf("unable to read private key: %w", err)
 	}
 
 	signer, err := ssh.ParsePrivateKey(key)
 	if err != nil {
-		return nil, fmt.Errorf("unable to parse private key: %v", err)
+		return nil, fmt.Errorf("unable to parse private key: %w", err)
 	}
 
 	authMethod := ssh.PublicKeys(signer)
@@ -284,6 +288,9 @@ func (s *SFTP) AddDirectoriesToWatcher(watcher *fsnotify.Watcher, rootDir string
 	})
 }
 func (s *SFTP) uploadFile(filePath string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	relativePath, err := filepath.Rel(s.config.LocalDir, filePath)
 	if err != nil {
 		return err
@@ -320,6 +327,9 @@ func (s *SFTP) uploadFile(filePath string) error {
 }
 
 func (s *SFTP) downloadFile(remotePath string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	relativePath, err := filepath.Rel(s.config.RemoteDir, remotePath)
 	if err != nil {
 		return err
@@ -361,12 +371,16 @@ func (s *SFTP) Mkdir(dir string) error {
 	return err
 }
 func (s *SFTP) RemoveRemoteFile(remotePath string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	err := s.Client.Remove(remotePath)
 	return err
 }
 
 func (s *SFTP) RemoveLocalFile(localPath string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	err := os.Remove(localPath)
 	return err
