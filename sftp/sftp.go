@@ -15,8 +15,6 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-
-
 type SyncDirection int
 
 const (
@@ -33,6 +31,7 @@ type SFTP struct {
 	ctx       context.Context
 	mu        sync.Mutex
 	Client    *sftp.Client
+	Pool      *WorkerPool
 }
 
 type ExtraConfig struct {
@@ -73,6 +72,7 @@ func Connect(address string, port int, direction SyncDirection, config *ExtraCon
 		Direction: direction,
 		config:    config,
 		ctx:       context.Background(),
+		Pool:      NewWorkerPool(10),
 	}, nil
 }
 
@@ -115,6 +115,7 @@ func ConnectSSHPair(address string, port int, direction SyncDirection, config *E
 		Direction: direction,
 		config:    config,
 		ctx:       context.Background(),
+		Pool:      NewWorkerPool(10),
 	}, nil
 }
 
@@ -185,6 +186,10 @@ func (s *SFTP) checkOrCreateDir(path string) error {
 }
 
 func (s *SFTP) WatchDirectory() {
+	// Starting the worker pool
+	for i := 0; i < cap(s.Pool.Tasks); i++ {
+		go s.worker()
+	}
 	logger.Println("Starting initial sync...")
 	err := s.initialSync()
 	if err != nil {
@@ -204,6 +209,9 @@ func (s *SFTP) WatchDirectory() {
 		}
 	}(watcher)
 
+	events := make(chan fsnotify.Event)
+	go s.watcherWorker(1, events)
+
 	go func() {
 		for {
 			select {
@@ -212,50 +220,9 @@ func (s *SFTP) WatchDirectory() {
 					return
 				}
 				logger.Println("Received event:", event)
-
-				// Add new directories to the watcher
-				if event.Op&fsnotify.Create == fsnotify.Create {
-					info, err := os.Stat(event.Name)
-					if err == nil && info.IsDir() {
-						err = watcher.Add(event.Name)
-						if err != nil {
-							logger.Println("Error adding directory to watcher:", err)
-						} else {
-							logger.Println("Adding new directory to watcher:", event.Name)
-						}
-					}
-				}
-
-				if event.Op&fsnotify.Write == fsnotify.Write {
-					logger.Println("Modified file:", event.Name)
-					if s.Direction == LocalToRemote {
-						err := s.uploadFile(event.Name)
-						if err != nil {
-							logger.Println("Error uploading file:", err)
-						}
-					}
-					if s.Direction == RemoteToLocal {
-						err := s.downloadFile(event.Name)
-						if err != nil {
-							logger.Println("Error downloading file:", err)
-						}
-					}
-				}
-				if event.Op&fsnotify.Remove == fsnotify.Remove {
-					logger.Println("Deleted file:", event.Name)
-					if s.Direction == LocalToRemote {
-						err := s.RemoveRemoteFile(event.Name)
-						if err != nil {
-							logger.Println("Error removing remote file:", err)
-						}
-					}
-					if s.Direction == RemoteToLocal {
-						err := s.RemoveLocalFile(event.Name)
-						if err != nil {
-							logger.Println("Error removing local file:", err)
-						}
-					}
-				}
+				s.Pool.wg.Add(1)
+				s.Pool.Tasks <- Task{EventType: event.Op, Name: event.Name}
+				events <- event
 			case err, ok := <-watcher.Errors:
 				if !ok {
 					return
