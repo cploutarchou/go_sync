@@ -32,7 +32,7 @@ type SFTP struct {
 	ctx       context.Context
 	mu        sync.Mutex
 	Client    *sftp.Client
-	Pool      *worker.WorkerPool
+	Pool      *worker.Pool
 }
 
 type ExtraConfig struct {
@@ -221,7 +221,7 @@ func (s *SFTP) WatchDirectory() {
 					return
 				}
 				logger.Println("Received event:", event)
-			
+
 				s.Pool.WG.Add(1)
 				s.Pool.Tasks <- worker.Task{EventType: event.Op, Name: event.Name}
 				events <- event
