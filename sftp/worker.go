@@ -2,29 +2,9 @@ package sftp
 
 import (
 	"os"
-	"sync"
 
 	"github.com/fsnotify/fsnotify"
 )
-
-// Task struct for WorkerPool to operate on
-type Task struct {
-	EventType fsnotify.Op
-	Name      string
-}
-
-// WorkerPool is a pool of workers that run tasks
-type WorkerPool struct {
-	Tasks chan Task
-	wg    sync.WaitGroup
-}
-
-// NewWorkerPool constructs a new WorkerPool of a given size
-func NewWorkerPool(size int) *WorkerPool {
-	return &WorkerPool{
-		Tasks: make(chan Task, size),
-	}
-}
 
 // worker is a function for workers to consume tasks and handle them
 func (s *SFTP) worker() {
@@ -59,7 +39,7 @@ func (s *SFTP) worker() {
 				}
 			}
 		}
-		s.Pool.wg.Done()
+		s.Pool.WG.Done()
 	}
 }
 

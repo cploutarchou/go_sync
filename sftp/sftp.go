@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/cploutarchou/syncpkg/worker"
 	"github.com/fsnotify/fsnotify"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
@@ -31,7 +32,7 @@ type SFTP struct {
 	ctx       context.Context
 	mu        sync.Mutex
 	Client    *sftp.Client
-	Pool      *WorkerPool
+	Pool      *worker.WorkerPool
 }
 
 type ExtraConfig struct {
@@ -72,7 +73,7 @@ func Connect(address string, port int, direction SyncDirection, config *ExtraCon
 		Direction: direction,
 		config:    config,
 		ctx:       context.Background(),
-		Pool:      NewWorkerPool(10),
+		Pool:      worker.NewWorkerPool(10),
 	}, nil
 }
 
@@ -115,7 +116,7 @@ func ConnectSSHPair(address string, port int, direction SyncDirection, config *E
 		Direction: direction,
 		config:    config,
 		ctx:       context.Background(),
-		Pool:      NewWorkerPool(10),
+		Pool:      worker.NewWorkerPool(10),
 	}, nil
 }
 
@@ -220,8 +221,9 @@ func (s *SFTP) WatchDirectory() {
 					return
 				}
 				logger.Println("Received event:", event)
-				s.Pool.wg.Add(1)
-				s.Pool.Tasks <- Task{EventType: event.Op, Name: event.Name}
+			
+				s.Pool.WG.Add(1)
+				s.Pool.Tasks <- worker.Task{EventType: event.Op, Name: event.Name}
 				events <- event
 			case err, ok := <-watcher.Errors:
 				if !ok {
