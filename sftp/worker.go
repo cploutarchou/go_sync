@@ -28,7 +28,8 @@ func (s *SFTP) worker() {
 			// If the event is a remove event, we either remove the remote file
 			// or the local file depending on the sync direction.
 			if s.Direction == LocalToRemote {
-				err := s.RemoveRemoteFile(task.Name)
+				path := s.config.RemoteDir + task.Name[len(s.config.LocalDir):]
+				err := s.RemoveRemoteFile(path)
 				if err != nil {
 					logger.Println("Error removing remote file:", err)
 				}
@@ -84,7 +85,8 @@ func (s *SFTP) watcherWorker(workerId int, events <-chan fsnotify.Event) {
 			if event.Op&fsnotify.Remove == fsnotify.Remove {
 				logger.Println("Deleted file:", event.Name)
 				if s.Direction == LocalToRemote {
-					err := s.RemoveRemoteFile(event.Name)
+					path := s.config.RemoteDir + event.Name[len(s.config.LocalDir):]
+					err := s.RemoveRemoteFile(path)
 					if err != nil {
 						logger.Println("Error removing remote file:", err)
 					}

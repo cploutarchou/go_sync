@@ -121,23 +121,33 @@ func ConnectSSHPair(address string, port int, direction SyncDirection, config *E
 }
 
 func (s *SFTP) initialSync() error {
+	return s.syncDir(s.config.LocalDir, s.config.RemoteDir)
+}
+
+func (s *SFTP) syncDir(localDir, remoteDir string) error {
 	switch s.Direction {
 	case LocalToRemote:
-		localFiles, err := os.ReadDir(s.config.LocalDir)
+		localFiles, err := os.ReadDir(localDir)
 		if err != nil {
 			return err
 		}
 		for _, file := range localFiles {
+			localFilePath := filepath.Join(localDir, file.Name())
+			remoteFilePath := filepath.Join(remoteDir, file.Name())
+
 			if file.IsDir() {
-				err = s.checkOrCreateDir(filepath.Join(s.config.LocalDir, file.Name()))
+				err = s.checkOrCreateDir(remoteFilePath)
+				if err != nil {
+					return err
+				}
+				err = s.syncDir(localFilePath, remoteFilePath)
 				if err != nil {
 					return err
 				}
 			} else {
-				remoteFilePath := filepath.Join(s.config.RemoteDir, file.Name())
 				_, err := s.Client.Stat(remoteFilePath)
 				if err != nil {
-					err = s.uploadFile(filepath.Join(s.config.LocalDir, file.Name()))
+					err = s.uploadFile(localFilePath)
 					if err != nil {
 						return err
 					}
@@ -146,22 +156,28 @@ func (s *SFTP) initialSync() error {
 		}
 
 	case RemoteToLocal:
-		remoteFiles, err := s.Client.ReadDir(s.config.RemoteDir)
+		remoteFiles, err := s.Client.ReadDir(remoteDir)
 		if err != nil {
 			return err
 		}
 
 		for _, file := range remoteFiles {
+			remoteFilePath := filepath.Join(remoteDir, file.Name())
+			localFilePath := filepath.Join(localDir, file.Name())
+
 			if file.IsDir() {
-				err = s.checkOrCreateDir(filepath.Join(s.config.RemoteDir, file.Name()))
+				err = s.checkOrCreateDir(localFilePath)
+				if err != nil {
+					return err
+				}
+				err = s.syncDir(localFilePath, remoteFilePath)
 				if err != nil {
 					return err
 				}
 			} else {
-				localFilePath := filepath.Join(s.config.LocalDir, file.Name())
 				_, err := os.Stat(localFilePath)
 				if err != nil {
-					err = s.downloadFile(filepath.Join(s.config.RemoteDir, file.Name()))
+					err = s.downloadFile(remoteFilePath)
 					if err != nil {
 						return err
 					}
@@ -169,7 +185,6 @@ func (s *SFTP) initialSync() error {
 			}
 		}
 	}
-
 	return nil
 }
 
@@ -178,9 +193,17 @@ func (s *SFTP) checkOrCreateDir(path string) error {
 	// It also recursively checks and creates subdirectories
 	_, err := os.Stat(path)
 	if os.IsNotExist(err) {
-		errDir := os.MkdirAll(path, 0755)
-		if errDir != nil {
-			return err
+		if s.Direction == LocalToRemote {
+			//create the directory to remote server if it doesn't exist  and all subdirectories
+			s.Client.MkdirAll(path)
+			// set the permissions to 755
+			s.Client.Chmod(path, 0755)
+
+		} else {
+			errDir := os.MkdirAll(path, 0755)
+			if errDir != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -340,8 +363,6 @@ func (s *SFTP) Mkdir(dir string) error {
 	return err
 }
 func (s *SFTP) RemoveRemoteFile(remotePath string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	err := s.Client.Remove(remotePath)
 	return err
