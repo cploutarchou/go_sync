@@ -2,6 +2,7 @@ package ftp
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -11,8 +12,11 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/cploutarchou/syncpkg/worker"
 	"github.com/fsnotify/fsnotify"
 )
+
+var logger = log.New(os.Stdout, "ftp: ", log.Lshortfile)
 
 type SyncDirection int
 
@@ -27,6 +31,8 @@ type FTP struct {
 	Direction SyncDirection
 	config    *ExtraConfig
 	Watcher   *fsnotify.Watcher
+	Pool      *worker.Pool
+	ctx       context.Context
 }
 
 type ExtraConfig struct {
@@ -48,6 +54,8 @@ func Connect(address string, port int, direction SyncDirection, config *ExtraCon
 	ftp := &FTP{
 		conn:      textproto.NewConn(conn),
 		Direction: direction,
+		ctx:       context.Background(),
+		Pool:      worker.NewWorkerPool(10),
 	}
 	ftp.config = config
 
@@ -104,6 +112,7 @@ func (f *FTP) List() ([]string, error) {
 
 	return files, nil
 }
+
 func (f *FTP) initialSync() error {
 	f.Lock()
 	defer f.Unlock()
@@ -140,20 +149,31 @@ func (f *FTP) initialSync() error {
 }
 
 func (f *FTP) WatchDirectory() {
+	// Starting the worker pool
+	for i := 0; i < cap(f.Pool.Tasks); i++ {
+		go f.worker()
+	}
+	logger.Println("Starting initial sync...")
 	err := f.initialSync()
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatal(err)
 	}
+	logger.Println("Initial sync done.")
+
+	logger.Println("Setting up watcher...")
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatal(err)
 	}
 	defer func(watcher *fsnotify.Watcher) {
-		err := watcher.Close()
+		err = watcher.Close()
 		if err != nil {
-			log.Println("Error closing watcher:", err)
+			logger.Println("Error closing watcher:", err)
 		}
 	}(watcher)
+
+	events := make(chan fsnotify.Event)
+	go f.watcherWorker(1, events)
 
 	go func() {
 		for {
@@ -162,52 +182,30 @@ func (f *FTP) WatchDirectory() {
 				if !ok {
 					return
 				}
-				if event.Op&fsnotify.Write == fsnotify.Write {
-					log.Println("Modified file:", event.Name)
-					if f.Direction == LocalToRemote {
-						err := f.uploadFile(event.Name)
-						if err != nil {
-							log.Println("Error uploading file:", err)
-						}
-					}
-					if f.Direction == RemoteToLocal {
-						err := f.downloadFile(event.Name)
-						if err != nil {
-							log.Println("Error downloading file:", err)
-						}
-					}
-				}
-				if event.Op&fsnotify.Remove == fsnotify.Remove {
-					log.Println("Deleted file:", event.Name)
-					if f.Direction == LocalToRemote {
-						err := f.removeRemoteFile(event.Name)
-						if err != nil {
-							log.Println("Error removing remote file:", err)
-						}
-					}
-					if f.Direction == RemoteToLocal {
-						err := f.removeLocalFile(event.Name)
-						if err != nil {
-							log.Println("Error removing local file:", err)
-						}
-					}
-				}
+				logger.Println("Received event:", event)
+
+				f.Pool.WG.Add(1)
+				f.Pool.Tasks <- worker.Task{EventType: event.Op, Name: event.Name}
+				events <- event
 			case err, ok := <-watcher.Errors:
 				if !ok {
 					return
 				}
-				log.Println("Error:", err)
+				logger.Println("Error:", err)
 			}
 		}
 	}()
 
-	err = watcher.Add(f.config.LocalDir)
+	// Add root directory and all subdirectories to the watcher
+	err = f.AddDirectoriesToWatcher(watcher, f.config.LocalDir)
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatal(err)
 	}
 
-	<-make(chan struct{})
+	<-f.ctx.Done()
+	logger.Println("Directory watch ended.")
 }
+
 func (f *FTP) uploadFile(filePath string) error {
 	f.Lock()
 	defer f.Unlock()
@@ -219,7 +217,7 @@ func (f *FTP) uploadFile(filePath string) error {
 	defer func(file *os.File) {
 		err := file.Close()
 		if err != nil {
-			log.Println("Error closing file:", err)
+			logger.Println("Error closing file:", err)
 		}
 	}(file)
 
@@ -265,7 +263,7 @@ func (f *FTP) downloadFile(name string) error {
 	defer func(file *os.File) {
 		err := file.Close()
 		if err != nil {
-			log.Println("Error closing file:", err)
+			logger.Println("Error closing file:", err)
 		}
 	}(file)
 
@@ -300,41 +298,6 @@ func (f *FTP) downloadFile(name string) error {
 	return nil
 }
 
-func (f *FTP) Stat(path string) (string, error) {
-	f.Lock()
-	defer f.Unlock()
-
-	_, err := f.conn.Cmd("PASV")
-	if err != nil {
-		return "", err
-	}
-
-	_, err = f.conn.Cmd("LIST %s", path)
-	if err != nil {
-		return "", err
-	}
-
-	reader := bufio.NewReader(f.conn.R)
-	line, _, err := reader.ReadLine()
-	if err != nil && err != io.EOF {
-		return "", err
-	}
-
-	return string(line), nil
-}
-
-func (f *FTP) Mkdir(dir string) error {
-	f.Lock()
-	defer f.Unlock()
-
-	_, err := f.conn.Cmd("MKD %s", dir)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
 func (f *FTP) removeRemoteFile(filePath string) error {
 	f.Lock()
 	defer f.Unlock()
@@ -357,4 +320,39 @@ func (f *FTP) removeLocalFile(filePath string) error {
 	}
 
 	return nil
+}
+func (f *FTP) AddDirectoriesToWatcher(watcher *fsnotify.Watcher, rootDir string) error {
+	return filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
+		if info.IsDir() {
+			err = watcher.Add(path)
+			if err != nil {
+				return err
+			}
+			logger.Println("Adding watcher to directory:", path)
+		}
+		return nil
+	})
+}
+
+func (f *FTP) Stat(path string) (os.FileInfo, error) {
+	f.Lock()
+	defer f.Unlock()
+
+	_, err := f.conn.Cmd("PASV")
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = f.conn.Cmd("STAT %s", path)
+	if err != nil {
+		return nil, err
+	}
+
+	reader := bufio.NewReader(f.conn.R)
+	line, _, err := reader.ReadLine()
+	if err != nil {
+		return nil, err
+	}
+
+	return os.Stat(string(line))
 }
