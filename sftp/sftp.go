@@ -7,8 +7,11 @@ import (
 	"log"
 	"os"
 	"os/user"
+	"path"
 	"path/filepath"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/cploutarchou/syncpkg/worker"
 	"github.com/fsnotify/fsnotify"
@@ -188,19 +191,23 @@ func (s *SFTP) syncDir(localDir, remoteDir string) error {
 	return nil
 }
 
-func (s *SFTP) checkOrCreateDir(path string) error {
-	// This checks the existence of a directory, creates it if doesn't exist
-	// It also recursively checks and creates subdirectories
-	_, err := os.Stat(path)
+func (s *SFTP) checkOrCreateDir(dirPath string) error {
+	_, err := os.Stat(dirPath)
 	if os.IsNotExist(err) {
 		if s.Direction == LocalToRemote {
 			//create the directory to remote server if it doesn't exist  and all subdirectories
-			s.Client.MkdirAll(path)
+			err := s.Client.MkdirAll(dirPath)
+			if err != nil {
+				return err
+			}
 			// set the permissions to 755
-			s.Client.Chmod(path, 0755)
+			err = s.Client.Chmod(dirPath, 0755)
+			if err != nil {
+				return err
+			}
 
 		} else {
-			errDir := os.MkdirAll(path, 0755)
+			errDir := os.MkdirAll(dirPath, 0755)
 			if errDir != nil {
 				return err
 			}
@@ -212,7 +219,7 @@ func (s *SFTP) checkOrCreateDir(path string) error {
 func (s *SFTP) WatchDirectory() {
 	// Starting the worker pool
 	for i := 0; i < cap(s.Pool.Tasks); i++ {
-		go s.worker()
+		go s.Worker()
 	}
 	logger.Println("Starting initial sync...")
 	err := s.initialSync()
@@ -233,9 +240,6 @@ func (s *SFTP) WatchDirectory() {
 		}
 	}(watcher)
 
-	events := make(chan fsnotify.Event)
-	go s.watcherWorker(1, events)
-
 	go func() {
 		for {
 			select {
@@ -247,7 +251,6 @@ func (s *SFTP) WatchDirectory() {
 
 				s.Pool.WG.Add(1)
 				s.Pool.Tasks <- worker.Task{EventType: event.Op, Name: event.Name}
-				events <- event
 			case err, ok := <-watcher.Errors:
 				if !ok {
 					return
@@ -257,10 +260,22 @@ func (s *SFTP) WatchDirectory() {
 		}
 	}()
 
-	// Add root directory and all subdirectories to the watcher
-	err = s.AddDirectoriesToWatcher(watcher, s.config.LocalDir)
-	if err != nil {
-		logger.Fatal(err)
+	logger.Println("Adding directories to watcher...")
+	switch s.Direction {
+	case LocalToRemote:
+		logger.Println("Adding watcher to local directory: ", s.config.LocalDir)
+		err = s.AddDirectoriesToWatcher(watcher, s.config.LocalDir)
+		if err != nil {
+			logger.Fatal(err)
+		}
+		logger.Println("Starting directory watch...")
+	case RemoteToLocal:
+		logger.Println("Adding watcher to remote directory: ", s.config.RemoteDir)
+		err = s.AddDirectoriesToWatcher(watcher, s.config.RemoteDir)
+		if err != nil {
+			logger.Fatal(err)
+		}
+		logger.Println("Starting directory watch...")
 	}
 
 	<-s.ctx.Done()
@@ -268,17 +283,59 @@ func (s *SFTP) WatchDirectory() {
 }
 
 func (s *SFTP) AddDirectoriesToWatcher(watcher *fsnotify.Watcher, rootDir string) error {
-	return filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
-		if info.IsDir() {
-			err = watcher.Add(path)
+	switch s.Direction {
+	case LocalToRemote:
+		return filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
+			if info.IsDir() {
+				err = watcher.Add(path)
+				if err != nil {
+					return err
+				}
+				logger.Println("Adding watcher to directory:", path)
+			}
+			return nil
+		})
+	case RemoteToLocal:
+		var prevFiles map[string]os.FileInfo
+		for {
+			// Read the remote directory and its subdirectories.
+			newFiles := make(map[string]os.FileInfo)
+			err := s.walkRemoteDir(rootDir, newFiles)
 			if err != nil {
 				return err
 			}
-			logger.Println("Adding watcher to directory:", path)
+
+			// Check for new or removed files.
+			if prevFiles != nil {
+				for p, file := range newFiles {
+					prevFile, exists := prevFiles[p]
+					if !exists || prevFile.ModTime().Before(file.ModTime()) {
+
+						s.Pool.WG.Add(1)
+
+						s.Pool.Tasks <- worker.Task{EventType: fsnotify.Create, Name: p}
+						logger.Println("New or modified file:", p)
+					}
+				}
+				for p := range prevFiles {
+					_, exists := newFiles[p]
+					if !exists {
+
+						s.Pool.WG.Add(1)
+
+						s.Pool.Tasks <- worker.Task{EventType: fsnotify.Remove, Name: p}
+						logger.Println("File removed:", p)
+					}
+				}
+			}
+			prevFiles = newFiles
+			// Wait for a while before checking again.
+			time.Sleep(time.Second * 1)
 		}
-		return nil
-	})
+	}
+	return nil
 }
+
 func (s *SFTP) uploadFile(filePath string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -319,9 +376,11 @@ func (s *SFTP) uploadFile(filePath string) error {
 }
 
 func (s *SFTP) downloadFile(remotePath string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
+	if strings.Contains(remotePath, ".swp") {
+		return nil
+	}
+	logger.Println("Downloading file:", remotePath)
 	relativePath, err := filepath.Rel(s.config.RemoteDir, remotePath)
 	if err != nil {
 		return err
@@ -358,20 +417,53 @@ func (s *SFTP) downloadFile(remotePath string) error {
 }
 
 func (s *SFTP) Mkdir(dir string) error {
-
 	err := s.Client.Mkdir(filepath.Join(s.config.RemoteDir, dir))
 	return err
 }
 func (s *SFTP) RemoveRemoteFile(remotePath string) error {
-
-	err := s.Client.Remove(remotePath)
+	relativePath, err := filepath.Rel(s.config.LocalDir, remotePath)
+	if err != nil {
+		return err
+	}
+	toRemotePath := filepath.Join(s.config.RemoteDir, relativePath)
+	err = s.Client.Remove(toRemotePath)
 	return err
 }
 
 func (s *SFTP) RemoveLocalFile(localPath string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	err := os.Remove(localPath)
+	toLocalPath := s.convertRemoteToLocalPath(localPath)
+	err := os.Remove(toLocalPath)
 	return err
+}
+
+// walkRemoteDir traverses a remote directory and its subdirectories,
+// adding all files it finds to the provided map.
+func (s *SFTP) walkRemoteDir(dir string, files map[string]os.FileInfo) error {
+	entries, err := s.Client.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		join := path.Join(dir, entry.Name())
+		if entry.IsDir() {
+			err = s.walkRemoteDir(join, files)
+			if err != nil {
+				return err
+			}
+		} else {
+			files[join] = entry
+
+		}
+	}
+
+	return nil
+}
+
+func (s *SFTP) convertRemoteToLocalPath(remotePath string) string {
+	relativePath, _ := filepath.Rel(s.config.RemoteDir, remotePath)
+	localPath := filepath.Join(s.config.LocalDir, relativePath)
+	return localPath
 }
