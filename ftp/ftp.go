@@ -151,7 +151,7 @@ func (f *FTP) initialSync() error {
 func (f *FTP) WatchDirectory() {
 	// Starting the worker pool
 	for i := 0; i < cap(f.Pool.Tasks); i++ {
-		go f.worker()
+		go f.Worker()
 	}
 	logger.Println("Starting initial sync...")
 	err := f.initialSync()
@@ -173,7 +173,6 @@ func (f *FTP) WatchDirectory() {
 	}(watcher)
 
 	events := make(chan fsnotify.Event)
-	go f.watcherWorker(1, events)
 
 	go func() {
 		for {
