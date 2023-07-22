@@ -1,7 +1,6 @@
 package sftp
 
 import (
-	"fmt"
 	"github.com/fsnotify/fsnotify"
 )
 
@@ -12,7 +11,6 @@ func (s *SFTP) Worker() {
 		case fsnotify.Create:
 			switch s.Direction {
 			case LocalToRemote:
-				fmt.Println("Uploading file:", task.Name)
 				err := s.uploadFile(task.Name)
 				if err != nil {
 					logger.Println("Error uploading file:", err)
