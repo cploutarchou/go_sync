@@ -1,13 +1,10 @@
 package ftp
 
 import (
-	"bufio"
 	"context"
 	"fmt"
-	"io"
+	"github.com/secsy/goftp"
 	"log"
-	"net"
-	"net/textproto"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,7 +26,7 @@ const (
 
 type FTP struct {
 	sync.Mutex
-	conn      *textproto.Conn
+	client    *goftp.Client
 	Direction SyncDirection
 	config    *ExtraConfig
 	Watcher   *fsnotify.Watcher
@@ -47,72 +44,43 @@ type ExtraConfig struct {
 }
 
 func Connect(address string, port int, direction SyncDirection, config *ExtraConfig) (*FTP, error) {
-	address = net.JoinHostPort(address, fmt.Sprintf("%d", port))
-	conn, err := net.Dial("tcp", address)
+	address = fmt.Sprintf("%s:%d", address, port)
+
+	ftpConfig := goftp.Config{
+		User:     config.Username,
+		Password: config.Password,
+	}
+
+	client, err := goftp.DialConfig(ftpConfig, address)
 	if err != nil {
 		return nil, err
 	}
 
 	ftp := &FTP{
-		conn:      textproto.NewConn(conn),
+		client:    client,
 		Direction: direction,
 		ctx:       context.Background(),
 		Pool:      worker.NewWorkerPool(10),
 	}
 	ftp.config = config
 
-	if config != nil {
-		err = ftp.Login(config.Username, config.Password)
-	} else {
-		err = ftp.Login("anonymous", "anonymous")
-	}
-	if err != nil {
-		_ = ftp.conn.Close()
-		return nil, err
-	}
 	logger.Println("Connected to FTP server.")
 	return ftp, nil
 }
-
-func (f *FTP) Login(username, password string) error {
-
-	_, err := f.conn.Cmd("USER %s", username)
-	if err != nil {
-		return err
-	}
-
-	_, err = f.conn.Cmd("PASS %s", password)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (f *FTP) List() ([]string, error) {
-	f.Lock()
-	defer f.Unlock()
-
-	_, err := f.conn.Cmd("PASV")
+func (f *FTP) List(path string) ([]string, error) {
+	files, err := f.client.ReadDir(path)
 	if err != nil {
 		return nil, err
 	}
 
-	_, err = f.conn.Cmd("LIST")
-	if err != nil {
-		return nil, err
+	var fileNames []string
+	for _, file := range files {
+		fileNames = append(fileNames, file.Name())
 	}
 
-	reader := bufio.NewReader(f.conn.R)
-	line, _, err := reader.ReadLine()
-	var files []string
-	for err == nil {
-		files = append(files, string(line))
-		line, _, err = reader.ReadLine()
-	}
-
-	return files, nil
+	return fileNames, nil
 }
+
 func (f *FTP) initialSync() error {
 	return f.syncDir(f.config.LocalDir, f.config.RemoteDir)
 }
@@ -129,8 +97,6 @@ func (f *FTP) syncDir(localDir, remoteDir string) error {
 			localFilePath := filepath.Join(localDir, file.Name())
 			remoteFilePath := filepath.Join(remoteDir, file.Name())
 			if file.IsDir() {
-				logger.Println("file is dir")
-				logger.Println("remoteFilePath", remoteFilePath)
 				err = f.checkOrCreateDir(remoteFilePath)
 				if err != nil {
 					return err
@@ -140,10 +106,15 @@ func (f *FTP) syncDir(localDir, remoteDir string) error {
 					return err
 				}
 			} else {
-				//stat remote file and if it doesn't exist upload it to the server
-				_, err := f.Stat(remoteFilePath)
+				// stat remote file and if it doesn't exist upload it to the server
+				_, err = f.client.Stat(remoteFilePath)
 				if err != nil {
-					err = f.uploadFile(localFilePath)
+					localFile, err := os.Open(localFilePath)
+					if err != nil {
+						return err
+					}
+					defer localFile.Close()
+					err = f.client.Store(remoteFilePath, localFile)
 					if err != nil {
 						return err
 					}
@@ -152,10 +123,37 @@ func (f *FTP) syncDir(localDir, remoteDir string) error {
 		}
 	case RemoteToLocal:
 		// Read the remote directory and all subdirectories.
-		remoteFiles, err := f.conn.Cmd("NLST %s", remoteDir)
-		fmt.Println("remoteFiles", remoteFiles)
+		remoteFiles, err := f.client.ReadDir(remoteDir)
 		if err != nil {
 			return err
+		}
+		for _, file := range remoteFiles {
+			remoteFilePath := filepath.Join(remoteDir, file.Name())
+			localFilePath := filepath.Join(localDir, file.Name())
+			if file.IsDir() {
+				err = f.checkOrCreateDir(localFilePath)
+				if err != nil {
+					return err
+				}
+				err = f.syncDir(localFilePath, remoteFilePath)
+				if err != nil {
+					return err
+				}
+			} else {
+				// stat local file and if it doesn't exist download it from the server
+				_, err = os.Stat(localFilePath)
+				if os.IsNotExist(err) {
+					localFile, err := os.Create(localFilePath)
+					if err != nil {
+						return err
+					}
+					defer localFile.Close()
+					err = f.client.Retrieve(remoteFilePath, localFile)
+					if err != nil {
+						return err
+					}
+				}
+			}
 		}
 	}
 	return nil
@@ -217,108 +215,83 @@ func (f *FTP) WatchDirectory() {
 }
 
 func (f *FTP) uploadFile(filePath string) error {
-
+	// Open the file for reading
 	file, err := os.Open(filePath)
 	if err != nil {
 		return err
 	}
-	defer func(file *os.File) {
-		err := file.Close()
-		if err != nil {
-			logger.Println("Error closing file:", err)
-		}
-	}(file)
+	defer file.Close()
 
+	// Try to upload the file for MaxRetries times
 	for i := 0; i < f.config.MaxRetries; i++ {
-		_, err = f.conn.Cmd("PASV")
-		if err != nil {
-			if i == f.config.MaxRetries-1 {
-				return err
-			}
-			continue
-		}
-
+		// Calculate the remote file path
 		correctedFilePath := strings.Replace(filePath, f.config.LocalDir, "", 1)
 		correctedFilePath = filepath.Join(f.config.RemoteDir, correctedFilePath)
 
-		_, err = f.conn.Cmd("STOR %s", correctedFilePath)
+		// Reset the file pointer to the beginning of the file
+		_, err = file.Seek(0, 0)
 		if err != nil {
-			if i == f.config.MaxRetries-1 {
-				return err
-			}
+			return err
+		}
+
+		// Upload the file to the FTP server
+		err = f.client.Store(correctedFilePath, file)
+		if err != nil {
+			// If upload fails, log the error and try again
+			logger.Printf("Attempt %d/%d: Error uploading file: %v", i+1, f.config.MaxRetries, err)
 			continue
+		} else {
+			// If upload succeeds, log the success and return nil
+			logger.Printf("Uploaded file: %s", filePath)
+			return nil
 		}
-
-		_, err = io.Copy(f.conn.W, file)
-		if err != nil {
-			if i == f.config.MaxRetries-1 {
-				return err
-			}
-			continue
-		}
-
-		if err != nil {
-			logger.Println("Error closing data connection:", err)
-		}
-
-		break
 	}
 
-	logger.Println("Uploaded file:", filePath)
-	return nil
+	// If we reach this point, all attempts to upload the file have failed
+	return fmt.Errorf("failed to upload file after %d attempts", f.config.MaxRetries)
 }
+
 func (f *FTP) downloadFile(name string) error {
 	f.Lock()
 	defer f.Unlock()
 
+	// Create the local file
 	file, err := os.Create(filepath.Join(f.config.LocalDir, name))
 	if err != nil {
 		return err
 	}
-	defer func(file *os.File) {
-		err := file.Close()
-		if err != nil {
-			logger.Println("Error closing file:", err)
-		}
-	}(file)
+	defer file.Close()
 
 	for i := 0; i < f.config.MaxRetries; i++ {
-		_, err = f.conn.Cmd("PASV")
-		if err != nil {
-			if i == f.config.MaxRetries-1 {
-				return err
-			}
-			continue
-		}
+		// Calculate the remote file path
+		remotePath := filepath.Join(f.config.RemoteDir, name)
 
-		_, err = f.conn.Cmd("RETR %s", filepath.Join(f.config.RemoteDir, name))
+		// Download the file from the FTP server
+		err = f.client.Retrieve(remotePath, file)
 		if err != nil {
-			if i == f.config.MaxRetries-1 {
-				return err
-			}
+			// If download fails, log the error and try again
+			logger.Printf("Attempt %d/%d: Error downloading file: %v", i+1, f.config.MaxRetries, err)
 			continue
+		} else {
+			// If download succeeds, log the success and return nil
+			logger.Printf("Downloaded file: %s", name)
+			return nil
 		}
-
-		_, err = io.Copy(file, f.conn.R)
-		if err != nil {
-			if i == f.config.MaxRetries-1 {
-				return err
-			}
-			continue
-		}
-
-		break
 	}
 
-	logger.Println("Downloaded file:", name)
-	return nil
+	// If we reach this point, all attempts to download the file have failed
+	return fmt.Errorf("failed to download file after %d attempts", f.config.MaxRetries)
 }
 
 func (f *FTP) removeRemoteFile(filePath string) error {
 	f.Lock()
 	defer f.Unlock()
 
-	_, err := f.conn.Cmd("DELE %s", filepath.Join(f.config.RemoteDir, filepath.Base(filePath)))
+	// Calculate the remote file path
+	remotePath := filepath.Join(f.config.RemoteDir, filepath.Base(filePath))
+
+	// Delete the file from the FTP server
+	err := f.client.Delete(remotePath)
 	if err != nil {
 		return err
 	}
@@ -399,72 +372,42 @@ func (f *FTP) Stat(path string) (os.FileInfo, error) {
 	f.Lock()
 	defer f.Unlock()
 
-	_, err := f.conn.Cmd("PASV")
+	// Calculate the remote file path
+	remotePath := filepath.Join(f.config.RemoteDir, filepath.Base(path))
+
+	// Fetch the file info from the FTP server
+	fileInfo, err := f.client.Stat(remotePath)
 	if err != nil {
 		return nil, err
 	}
 
-	_, err = f.conn.Cmd("STAT %s", path)
-	if err != nil {
-		return nil, err
-	}
-
-	reader := bufio.NewReader(f.conn.R)
-	line, _, err := reader.ReadLine()
-	if err != nil {
-		return nil, err
-	}
-
-	return os.Stat(string(line))
+	return fileInfo, nil
 }
-
-// walkRemoteDir traverses a remote directory and its subdirectories,
-// adding all files it finds to the provided map.
 func (f *FTP) walkRemoteDir(dir string, files map[string]os.FileInfo) error {
-	_, err := f.conn.Cmd("PASV")
+	// Use the ReadDir to list the contents of the directory.
+	fileInfos, err := f.client.ReadDir(dir)
 	if err != nil {
 		return err
 	}
 
-	// Use the NLST command to list the contents of the directory.
-	_, err = f.conn.Cmd("NLST %s", dir)
-	if err != nil {
-		return err
-	}
-
-	// Read the response from the FTP server.
-	reader := bufio.NewReader(f.conn.R)
-	line, _, err := reader.ReadLine()
-	for err == nil {
-		// Check if the line represents a file or a directory.
-		fileInfo, err := f.Stat(filepath.Join(dir, string(line)))
-		if err == nil {
+	for _, fileInfo := range fileInfos {
+		// Check if the fileInfo represents a file or a directory.
+		if fileInfo.IsDir() {
 			// If it's a directory, add it to the files map and recursively call walkRemoteDir.
-			if fileInfo.IsDir() {
-				files[filepath.Join(dir, string(line))] = fileInfo
-				err = f.walkRemoteDir(filepath.Join(dir, string(line)), files)
-				if err != nil {
-					return err
-				}
-			} else {
-				// If it's a file, add it to the files map.
-				files[filepath.Join(dir, string(line))] = fileInfo
+			files[filepath.Join(dir, fileInfo.Name())] = fileInfo
+			err = f.walkRemoteDir(filepath.Join(dir, fileInfo.Name()), files)
+			if err != nil {
+				return err
 			}
 		} else {
-			// If there was an error getting the file info, skip the entry.
-			logger.Println("Error getting file info:", err)
+			// If it's a file, add it to the files map.
+			files[filepath.Join(dir, fileInfo.Name())] = fileInfo
 		}
-
-		line, _, err = reader.ReadLine()
-	}
-
-	// Ignore the error for "EOF" as it's expected when there are no more lines to read.
-	if err != io.EOF {
-		return err
 	}
 
 	return nil
 }
+
 func (f *FTP) checkOrCreateDir(dirPath string) error {
 	pathParts := strings.Split(dirPath, "/")
 	currentPath := ""
@@ -474,10 +417,10 @@ func (f *FTP) checkOrCreateDir(dirPath string) error {
 		for _, part := range pathParts {
 			currentPath = currentPath + "/" + part
 			// First, try to make the directory
-			_, err := f.conn.Cmd("MKD %s", currentPath)
+			_, err := f.client.Mkdir(currentPath)
 			if err != nil {
-				// If that fails, assume it's because the directory already exists and try to change into it
-				_, err := f.conn.Cmd("CWD %s", currentPath)
+				// If that fails, assume it's because the directory already exists and check it
+				_, err := f.client.ReadDir(currentPath)
 				if err != nil {
 					// If that also fails, return the error
 					return err
@@ -487,7 +430,7 @@ func (f *FTP) checkOrCreateDir(dirPath string) error {
 	case RemoteToLocal:
 		for _, part := range pathParts {
 			currentPath = filepath.Join(currentPath, part)
-			err := os.Mkdir(currentPath, os.ModePerm)
+			err := os.MkdirAll(currentPath, os.ModePerm)
 			if err != nil {
 				// If that fails, assume it's because the directory already exists
 				if !os.IsExist(err) {
