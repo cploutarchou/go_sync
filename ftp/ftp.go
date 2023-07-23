@@ -118,6 +118,7 @@ func (f *FTP) initialSync() error {
 }
 
 func (f *FTP) syncDir(localDir, remoteDir string) error {
+	logger.Println("syncDir localDir", localDir)
 	switch f.Direction {
 	case LocalToRemote:
 		localFiles, err := os.ReadDir(localDir)
@@ -127,10 +128,6 @@ func (f *FTP) syncDir(localDir, remoteDir string) error {
 		for _, file := range localFiles {
 			localFilePath := filepath.Join(localDir, file.Name())
 			remoteFilePath := filepath.Join(remoteDir, file.Name())
-
-			logger.Println("localFilePath", localFilePath)
-			logger.Println("remoteFilePath", remoteFilePath)
-
 			if file.IsDir() {
 				logger.Println("file is dir")
 				logger.Println("remoteFilePath", remoteFilePath)
@@ -143,8 +140,6 @@ func (f *FTP) syncDir(localDir, remoteDir string) error {
 					return err
 				}
 			} else {
-				logger.Println("file is not dir")
-				logger.Println("remoteFilePath", remoteFilePath)
 				//stat remote file and if it doesn't exist upload it to the server
 				_, err := f.Stat(remoteFilePath)
 				if err != nil {
@@ -157,12 +152,11 @@ func (f *FTP) syncDir(localDir, remoteDir string) error {
 		}
 	case RemoteToLocal:
 		// Read the remote directory and all subdirectories.
-		remoteFiles, err := f.conn.Cmd("NLST %f", remoteDir)
+		remoteFiles, err := f.conn.Cmd("NLST %s", remoteDir)
 		fmt.Println("remoteFiles", remoteFiles)
 		if err != nil {
 			return err
 		}
-
 	}
 	return nil
 }
@@ -185,13 +179,11 @@ func (f *FTP) WatchDirectory() {
 		logger.Fatal(err)
 	}
 	defer func(watcher *fsnotify.Watcher) {
-		err = watcher.Close()
-		if err != nil {
-			logger.Println("Error closing watcher:", err)
-		}
-	}(watcher)
+		_ = watcher.Close()
+	}(watcher) // Moved defer to here.
 
 	events := make(chan fsnotify.Event)
+	defer close(events)
 
 	go func() {
 		for {
@@ -225,8 +217,6 @@ func (f *FTP) WatchDirectory() {
 }
 
 func (f *FTP) uploadFile(filePath string) error {
-	f.Lock()
-	defer f.Unlock()
 
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -248,7 +238,10 @@ func (f *FTP) uploadFile(filePath string) error {
 			continue
 		}
 
-		_, err = f.conn.Cmd("STOR %s", filepath.Join(f.config.RemoteDir, filepath.Base(filePath)))
+		correctedFilePath := strings.Replace(filePath, f.config.LocalDir, "", 1)
+		correctedFilePath = filepath.Join(f.config.RemoteDir, correctedFilePath)
+
+		_, err = f.conn.Cmd("STOR %s", correctedFilePath)
 		if err != nil {
 			if i == f.config.MaxRetries-1 {
 				return err
@@ -264,12 +257,16 @@ func (f *FTP) uploadFile(filePath string) error {
 			continue
 		}
 
+		if err != nil {
+			logger.Println("Error closing data connection:", err)
+		}
+
 		break
 	}
 
+	logger.Println("Uploaded file:", filePath)
 	return nil
 }
-
 func (f *FTP) downloadFile(name string) error {
 	f.Lock()
 	defer f.Unlock()
@@ -313,6 +310,7 @@ func (f *FTP) downloadFile(name string) error {
 		break
 	}
 
+	logger.Println("Downloaded file:", name)
 	return nil
 }
 
@@ -361,23 +359,19 @@ func (f *FTP) AddDirectoriesToWatcher(watcher *fsnotify.Watcher, rootDir string)
 			if err != nil {
 				return err
 			}
-
 			// Check for new or removed files.
 			if prevFiles != nil {
 				for p, file := range newFiles {
 					prevFile, exists := prevFiles[p]
 					if !exists || prevFile.ModTime().Before(file.ModTime()) {
-
 						f.Pool.WG.Add(1)
+						f.Pool.Tasks <- worker.Task{EventType: fsnotify.Write, Name: p}
 
-						f.Pool.Tasks <- worker.Task{EventType: fsnotify.Create, Name: p}
-						logger.Println("New or modified file:", p)
 					}
 				}
 				for p := range prevFiles {
 					_, exists := newFiles[p]
 					if !exists {
-
 						f.Pool.WG.Add(1)
 
 						f.Pool.Tasks <- worker.Task{EventType: fsnotify.Remove, Name: p}
@@ -386,8 +380,16 @@ func (f *FTP) AddDirectoriesToWatcher(watcher *fsnotify.Watcher, rootDir string)
 				}
 			}
 			prevFiles = newFiles
-			// Wait for a while before checking again.
-			time.Sleep(time.Second * 1)
+
+			// Add a condition to stop the infinite loop.
+			// For instance, if context has been cancelled:
+			select {
+			case <-f.ctx.Done():
+				return nil
+			default:
+				// Wait for a while before checking again.
+				time.Sleep(time.Second * 1)
+			}
 		}
 	}
 	return nil
@@ -464,73 +466,36 @@ func (f *FTP) walkRemoteDir(dir string, files map[string]os.FileInfo) error {
 	return nil
 }
 func (f *FTP) checkOrCreateDir(dirPath string) error {
+	pathParts := strings.Split(dirPath, "/")
+	currentPath := ""
+
 	switch f.Direction {
 	case LocalToRemote:
-		id, err := f.conn.Cmd("CWD %s", dirPath)
-		if err == nil {
-			logger.Println("Directory exists:", id)
-			_, _, err = f.conn.ReadCodeLine(250)
-			switch {
-			case strings.Contains(err.Error(), "250"):
-				return nil
-			default:
-				// Directory doesn't exist, create it.
-				_, err = f.conn.Cmd("MKD %s", dirPath)
+		for _, part := range pathParts {
+			currentPath = currentPath + "/" + part
+			// First, try to make the directory
+			_, err := f.conn.Cmd("MKD %s", currentPath)
+			if err != nil {
+				// If that fails, assume it's because the directory already exists and try to change into it
+				_, err := f.conn.Cmd("CWD %s", currentPath)
 				if err != nil {
+					// If that also fails, return the error
 					return err
 				}
-				// give the server time to create the directory
-				time.Sleep(time.Second * 1)
-				// Check if the directory was created. and give the proper permissions
-				_, err = f.conn.Cmd("CWD %s", dirPath)
-				if err != nil {
-					return err
-				}
-				_, _, err = f.conn.ReadCodeLine(250)
-				if err != nil {
-					return err
-				}
-				//give the proper permissions
-				_, err = f.conn.Cmd("SITE CHMOD 777 %s", dirPath)
-				if err != nil {
-					return err
-				}
-				return nil
 			}
 		}
-
 	case RemoteToLocal:
-		// Read the remote directory and all subdirectories.
-		_, err := f.conn.Cmd("NLST %f", dirPath)
-		if err != nil {
-			return err
-
-		}
-		// read the response from the FTP server.
-		reader := bufio.NewReader(f.conn.R)
-		line, _, err := reader.ReadLine()
-		for err == nil {
-			// Check if the line represents a file or a directory.
-			fileInfo, err := f.Stat(filepath.Join(dirPath, string(line)))
-			if err == nil {
-				// If it's a directory, add it to the files map and recursively call walkRemoteDir.
-				if fileInfo.IsDir() {
-					err = f.checkOrCreateDir(filepath.Join(dirPath, string(line)))
-					if err != nil {
-						return err
-					}
-				} else {
-					// If it's a file, add it to the files map.
-					return nil
+		for _, part := range pathParts {
+			currentPath = filepath.Join(currentPath, part)
+			err := os.Mkdir(currentPath, os.ModePerm)
+			if err != nil {
+				// If that fails, assume it's because the directory already exists
+				if !os.IsExist(err) {
+					// If the error is not because the directory already exists, return the error
+					return err
 				}
-			} else {
-				// If there was an error getting the file info, skip the entry.
-				logger.Println("Error getting file info:", err)
 			}
-
-			line, _, err = reader.ReadLine()
 		}
-
 	}
 
 	return nil
