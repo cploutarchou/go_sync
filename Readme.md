@@ -1,65 +1,82 @@
-# SSH, FTP, and SFTP Syncing Package
+# FTP and SFTP Packages
 
-This package provides a unified solution to sync files/directories via SSH, FTP, and SFTP protocols. It's designed with user-friendly APIs, which allow you to establish a connection, initiate the synchronization, and manage the connection lifecycle.
+These Go packages provide functionality for interacting with FTP and SFTP servers. The packages are designed to make it easy to perform file transfers and other operations over FTP and SFTP protocols in Go applications.
+
+## Features
+
+- FTP Package:
+  - Connect to an FTP server
+  - Watch a directory for changes on the FTP server:
+    - Upload files to the FTP server
+	- Download files from the FTP server
+	- Delete files from the FTP server
+	- Update files on the FTP server
+
+
+- SFTP Package:
+  - Connect to an SFTP server (using SSH or public key authentication)
+  - Watch a directory for changes on the SFTP server:
+	- Upload files to the SFTP server
+	- Download files from the SFTP server
+	- Delete files from the SFTP server
+	- Update files on the SFTP server
+
 
 ## Installation
 
-Use `go get` to add this package to your project.
+To use the packages in your Go application, you can install them using `go get`:
 
 ```bash
-go get github.com/yourusername/syncpkg
+go get github.com/cploutarchou/syncpkg/ftp
 ```
-## Configuration
-The syncing direction, local/remote paths, and the sync interval are all configurable.
 
-Here's a sample configuration:
-
-```go
-config := Config{
-	Host:         "localhost",
-	Port:         "22",
-	Username:     "user",
-	Password:     "password",
-	SyncDir:      LocalToRemote,
-	LocalPath:    "/path/to/local/directory",
-	RemotePath:   "/path/to/remote/directory",
-	SyncInterval: 5 * time.Minute,
-}
+```bash
+go get github.com/cploutarchou/syncpkg/sftp
 ```
+
 ## Usage
-Here is a simple usage example:
+
+### FTP Package
+
+The following example demonstrates how to use the FTP package to connect to an FTP server and monitor a directory for changes on the p
 
 ```go
-// Create new instance
-sync, err := NewSyncSSH(config)
-if err != nil {
-	log.Fatal(err)
+package main
+
+import (
+	"os"
+
+	"github.com/cploutarchou/syncpkg/sftp"
+)
+
+func main() {
+	// Get the current working directory
+	dir, err := os.Getwd()
+	if err != nil {
+		panic(err)
+	}
+	// Set the local directory to the sample_data directory
+	dir = dir + "/sample_data"
+	// Connect to the FTP server
+	ftpClient, err := sftp.Connect(
+		"127.0.0.1",
+		21,
+		sftp.RemoteToLocal,
+		&sftp.ExtraConfig{
+			Username:   "yourusername",
+			Password:   "yourpassword",
+			LocalDir:   dir,
+			RemoteDir:  "/home/chris/test",
+			Retries:    3,
+			MaxRetries: 5,
+		})
+
+	if err != nil {
+		panic(err)
+	}
+	// Watch the directory for changes
+	ftpClient.WatchDirectory()
 }
 
-// Start syncing
-sync.StartSync()
-
-// Close when done
-defer sync.Close()
 ```
 
-## Package Structure
-### SyncSSH
-SyncSSH is the main struct that handles the synchronization tasks. It maintains the SSH connection and context for synchronization operations.
-
-### Config
-Config struct is used to configure the SyncSSH instance. It includes SSH credentials, sync paths, and the sync interval.
-
-### SyncDirection
-SyncDirection is an enum-like type that defines the sync direction - local to remote or remote to local.
-
-### Error Handling
-Errors during synchronization are logged and don't interrupt the ongoing sync operation. This allows the syncing to be resilient against temporary network issues or file system inconsistencies.
-
-### Cleanup
-Always close the SyncSSH instance when you're done with it to ensure all resources are freed.
-
-### Contributing
-Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
-
-Please make sure to update tests as appropriate.
