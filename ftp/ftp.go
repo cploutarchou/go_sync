@@ -282,6 +282,17 @@ func (f *FTP) WatchDirectory() {
 	logger.Println("Directory watch ended.")
 }
 
+// uploadFile is a method of the FTP struct that uploads a file to the remote FTP server.
+//
+// - filePath is the path to the local file that needs to be uploaded.
+//
+// The method attempts to upload the file to the FTP server for a maximum number of retries specified in f.config.MaxRetries.
+// If the upload fails for any reason, the method will log the error and retry until the maximum number of retries is reached.
+//
+// The method calculates the remote file path based on the local file path and the remote directory specified in f.config.RemoteDir.
+// It then opens the local file for reading and uploads it to the FTP server using the f.client.Store method.
+//
+// - Returns an error if the file upload fails after the maximum number of retries.
 func (f *FTP) uploadFile(filePath string) error {
 	// Open the file for reading
 	file, err := os.Open(filePath)
@@ -321,6 +332,17 @@ func (f *FTP) uploadFile(filePath string) error {
 	return fmt.Errorf("failed to upload file after %d attempts", f.config.MaxRetries)
 }
 
+// downloadFile is a method of the FTP struct that downloads a file from the remote FTP server to the local file system.
+//
+// - name is the name of the file to be downloaded from the remote server.
+//
+// The method attempts to download the file from the FTP server for a maximum number of retries specified in f.config.MaxRetries.
+// If the download fails for any reason, the method will log the error and retry until the maximum number of retries is reached.
+//
+// The method calculates the remote file path based on the file name and the remote directory specified in f.config.RemoteDir.
+// It then creates a new local file and downloads the remote file from the FTP server using the f.client.Retrieve method.
+//
+// - Returns an error if the file download fails after the maximum number of retries.
 func (f *FTP) downloadFile(name string) error {
 	f.Lock()
 	defer f.Unlock()
@@ -355,11 +377,19 @@ func (f *FTP) downloadFile(name string) error {
 	return fmt.Errorf("failed to download file after %d attempts", f.config.MaxRetries)
 }
 
+// removeRemoteFile is a method of the FTP struct that deletes a file from the remote FTP server.
+//
+// - filePath is the path to the local file whose remote counterpart needs to be deleted.
+//
+// The method calculates the remote file path based on the local file path and the remote directory specified in f.config.RemoteDir.
+// It then sends a delete command to the FTP server using the f.client.Delete method to remove the file from the server.
+//
+// - Returns an error if the file deletion operation fails.
 func (f *FTP) removeRemoteFile(filePath string) error {
 	f.Lock()
 	defer f.Unlock()
 
-	// get the remote file path from the local file path and the remote directory
+	// Get the remote file path from the local file path and the remote directory
 	remotePath := strings.Replace(filePath, f.config.LocalDir, f.config.RemoteDir, 1)
 
 	// Delete the file from the FTP server
@@ -371,6 +401,13 @@ func (f *FTP) removeRemoteFile(filePath string) error {
 	return nil
 }
 
+// removeLocalFile is a method of the FTP struct that deletes a file from the local file system.
+//
+// - filePath is the path to the local file that needs to be deleted.
+//
+// The method uses the os.Remove function to delete the specified file from the local file system.
+//
+// - Returns an error if the file deletion operation fails.
 func (f *FTP) removeLocalFile(filePath string) error {
 	f.Lock()
 	defer f.Unlock()
@@ -382,6 +419,24 @@ func (f *FTP) removeLocalFile(filePath string) error {
 
 	return nil
 }
+
+// AddDirectoriesToWatcher is a method of the FTP struct that adds directories and their subdirectories to the fsnotify watcher.
+//
+// - watcher is a pointer to the fsnotify.Watcher that will be used to watch for file system events.
+//
+// - rootDir is the root directory from which directories and subdirectories will be added to the watcher.
+//
+// The method behaves differently based on the sync direction specified in f.Direction:
+//
+//   - LocalToRemote: It walks the local directory tree starting from rootDir and adds all directories to the fsnotify watcher.
+//     Each time a new directory is added, the method logs the event and starts watching for file system events in that directory.
+//
+//   - RemoteToLocal: It continuously reads the remote directory tree and its subdirectories and compares it with the previous state.
+//     When new files are detected or files are modified on the remote server, the method enqueues tasks to the worker pool for processing.
+//     If files are removed from the remote server, the method enqueues tasks to the worker pool to handle the file removal.
+//     The method keeps monitoring for changes in the remote directory tree until the context (f.ctx) is canceled or an error occurs.
+//
+// - Returns an error if there is a problem while adding directories to the fsnotify watcher or monitoring the remote directory tree.
 func (f *FTP) AddDirectoriesToWatcher(watcher *fsnotify.Watcher, rootDir string) error {
 	switch f.Direction {
 	case LocalToRemote:
@@ -411,14 +466,12 @@ func (f *FTP) AddDirectoriesToWatcher(watcher *fsnotify.Watcher, rootDir string)
 					if !exists || prevFile.ModTime().Before(file.ModTime()) {
 						f.Pool.WG.Add(1)
 						f.Pool.Tasks <- worker.Task{EventType: fsnotify.Write, Name: p}
-
 					}
 				}
 				for p := range prevFiles {
 					_, exists := newFiles[p]
 					if !exists {
 						f.Pool.WG.Add(1)
-
 						f.Pool.Tasks <- worker.Task{EventType: fsnotify.Remove, Name: p}
 						logger.Println("File removed:", p)
 					}
@@ -426,8 +479,8 @@ func (f *FTP) AddDirectoriesToWatcher(watcher *fsnotify.Watcher, rootDir string)
 			}
 			prevFiles = newFiles
 
-			// Add a condition to stop the infinite loop.
-			// For instance, if context has been cancelled:
+			// TODO : Add a condition to stop the infinite loop.
+			// For instance, if the context (f.ctx) has been canceled:
 			select {
 			case <-f.ctx.Done():
 				return nil
@@ -440,6 +493,16 @@ func (f *FTP) AddDirectoriesToWatcher(watcher *fsnotify.Watcher, rootDir string)
 	return nil
 }
 
+// Stat is a method of the FTP struct that retrieves file information (os.FileInfo) for a remote file on the FTP server.
+//
+// - path is the path of the remote file for which file information is required.
+//
+// The method calculates the remote file path by joining the remote directory (f.config.RemoteDir) with the base name of the specified path.
+// It then fetches the file information from the FTP server using the f.client.Stat method.
+//
+// - Returns the file information (os.FileInfo) for the remote file if the operation is successful.
+//
+// - Returns an error if there is a problem retrieving the file information from the FTP server.
 func (f *FTP) Stat(path string) (os.FileInfo, error) {
 	f.Lock()
 	defer f.Unlock()
@@ -455,6 +518,18 @@ func (f *FTP) Stat(path string) (os.FileInfo, error) {
 
 	return fileInfo, nil
 }
+
+// walkRemoteDir is a method of the FTP struct that recursively lists the contents of a remote directory on the FTP server and populates the provided map with file information (os.FileInfo) for each file found.
+//
+// - dir is the path of the remote directory to be traversed.
+//
+// - files is the map that will be populated with file information for each file found in the remote directory and its subdirectories.
+//
+// The method uses f.client.ReadDir to list the contents of the specified remote directory. For each item in the directory, it checks if it represents a file or a subdirectory. If it's a subdirectory, it adds it to the files map and recursively calls itself with the subdirectory path. If it's a file, it adds it to the files map with its path.
+//
+// - Returns an error if there is a problem reading the remote directory or its subdirectories.
+//
+// Note: The provided map (files) should be initialized before calling this method to collect the file information. The method only collects file information and does not modify the map if it already contains data.
 func (f *FTP) walkRemoteDir(dir string, files map[string]os.FileInfo) error {
 	// Use the ReadDir to list the contents of the directory.
 	fileInfos, err := f.client.ReadDir(dir)
@@ -480,6 +555,17 @@ func (f *FTP) walkRemoteDir(dir string, files map[string]os.FileInfo) error {
 	return nil
 }
 
+// checkOrCreateDir is a method of the FTP struct that checks if the specified directory exists on either the local or remote side (depending on the sync direction) and creates it if it doesn't exist.
+//
+// - dirPath is the path of the directory to be checked and created (if necessary).
+//
+// The method first splits the directory path into individual parts using strings.Split. Then, depending on the sync direction (LocalToRemote or RemoteToLocal), it either checks and creates the directory on the remote FTP server using f.client.Mkdir or on the local machine using os.MkdirAll.
+//
+// - For LocalToRemote sync direction, the method uses f.client.Mkdir to try creating the directory on the FTP server. If the directory already exists on the server, it assumes the operation is successful. If the directory does not exist, it returns an error.
+//
+// - For RemoteToLocal sync direction, the method uses os.MkdirAll to create the directory on the local machine. If the directory already exists locally, it assumes the operation is successful. If the directory does not exist, it creates all necessary parent directories recursively.
+//
+// - Returns an error if there is a problem creating the directory on either the local or remote side.
 func (f *FTP) checkOrCreateDir(dirPath string) error {
 	pathParts := strings.Split(dirPath, "/")
 	currentPath := ""
@@ -516,7 +602,27 @@ func (f *FTP) checkOrCreateDir(dirPath string) error {
 	return nil
 }
 
-// Worker starts a new worker goroutine.
+// Worker starts a new worker goroutine that processes tasks received from the worker pool.
+//
+// The method listens for tasks on the f.Pool.Tasks channel, which is a buffered channel used for queuing tasks. Each task contains an EventType (fsnotify.Write, fsnotify.Remove, fsnotify.Rename, fsnotify.Chmod) and a Name (the file path of the task).
+//
+// Depending on the EventType and the sync direction (LocalToRemote or RemoteToLocal), the method performs different actions:
+//
+// - For fsnotify.Write events:
+//   - LocalToRemote: Calls f.uploadFile to upload the modified or newly created file to the remote FTP server.
+//   - RemoteToLocal: Calls f.downloadFile to download the modified or newly created file from the remote FTP server to the local machine.
+//
+// - For fsnotify.Remove events:
+//   - LocalToRemote: Calls f.removeRemoteFile to delete the specified file from the remote FTP server.
+//   - RemoteToLocal: Calls f.removeLocalFile to delete the specified file from the local machine.
+//
+// - For fsnotify.Rename events:
+//   - LocalToRemote: Calls f.uploadFile to upload the renamed file to the remote FTP server, then calls f.removeRemoteFile to delete the original file from the server.
+//   - RemoteToLocal: Calls f.downloadFile to download the renamed file from the remote FTP server to the local machine, then calls f.removeLocalFile to delete the original file from the local machine.
+//
+// - For fsnotify.Chmod events: The method logs a message indicating that the permissions of a file have changed.
+//
+// After processing each task, the method marks it as done using f.Pool.WG.Done(), which decrements the worker pool's WaitGroup counter.
 func (f *FTP) Worker() {
 	defer f.Pool.WG.Done()
 	for task := range f.Pool.Tasks {
