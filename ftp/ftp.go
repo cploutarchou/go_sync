@@ -113,7 +113,9 @@ func (f *FTP) syncDir(localDir, remoteDir string) error {
 					if err != nil {
 						return err
 					}
-					defer localFile.Close()
+					defer func(localFile *os.File) {
+						_ = localFile.Close()
+					}(localFile)
 					err = f.client.Store(remoteFilePath, localFile)
 					if err != nil {
 						return err
@@ -147,7 +149,9 @@ func (f *FTP) syncDir(localDir, remoteDir string) error {
 					if err != nil {
 						return err
 					}
-					defer localFile.Close()
+					defer func(localFile *os.File) {
+						_ = localFile.Close()
+					}(localFile)
 					err = f.client.Retrieve(remoteFilePath, localFile)
 					if err != nil {
 						return err
@@ -216,7 +220,9 @@ func (f *FTP) uploadFile(filePath string) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer func(file *os.File) {
+		_ = file.Close()
+	}(file)
 
 	// Try to upload the file for MaxRetries times
 	for i := 0; i < f.config.MaxRetries; i++ {
@@ -256,7 +262,9 @@ func (f *FTP) downloadFile(name string) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer func(file *os.File) {
+		_ = file.Close()
+	}(file)
 
 	for i := 0; i < f.config.MaxRetries; i++ {
 		// Calculate the remote file path
