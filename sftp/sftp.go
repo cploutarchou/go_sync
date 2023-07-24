@@ -19,34 +19,87 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+// SyncDirection is the direction of the sync operation
 type SyncDirection int
 
 const (
+	//LocalToRemote is the direction of the sync operation from local to remote
 	LocalToRemote SyncDirection = iota
+	//RemoteToLocal is the direction of the sync operation from remote to local
 	RemoteToLocal
 )
 
+// Logger is the logger used by the package. It defaults to log.New(os.Stdout, "sftp: ", log.Lshortfile)
 var logger = log.New(os.Stdout, "sftp: ", log.Lshortfile)
 
+// SFtp is the struct that holds the sftp client and the sync direction
 type SFTP struct {
+	//Direction is the direction of the sync operation
 	Direction SyncDirection
-	config    *ExtraConfig
-	Watcher   *fsnotify.Watcher
-	ctx       context.Context
-	mu        sync.Mutex
-	Client    *sftp.Client
-	Pool      *worker.Pool
+	//config is the extra configuration for the sftp client
+	config *ExtraConfig
+	//Watcher is the fsnotify watcher used to watch for file changes
+	Watcher *fsnotify.Watcher
+	//ctx is the context used to cancel the watcher and the worker pool
+	ctx context.Context
+	//mu is the mutex used to lock the sftp client when uploading/downloading files
+	mu sync.Mutex
+	//Client is the sftp client
+	Client *sftp.Client
+	//Pool is the worker pool
+	Pool *worker.Pool
 }
 
+// ExtraConfig is the struct that holds the extra configuration for the sftp client
 type ExtraConfig struct {
-	Username   string
-	Password   string
-	LocalDir   string
-	RemoteDir  string
-	Retries    int
+	//Username is the username used to connect to the sftp server
+	Username string
+	//Password is the password used to connect to the sftp server
+	Password string
+	//LocalDir is the local directory to sync with the remote directory
+	LocalDir string
+	//RemoteDir is the remote directory to sync with the local directory
+	RemoteDir string
+	//Retries is the number of retries to connect to the sftp server
+	Retries int
+	//MaxRetries is the maximum number of retries to connect to the sftp server
 	MaxRetries int
 }
 
+// Connect establishes an SFTP connection to the remote server at the specified address and port.
+// The function returns an *SFTP object that represents the connection, allowing you to perform file synchronization
+// and other SFTP operations between the local and remote directories.
+//
+// Parameters:
+//   - address: The IP address or hostname of the remote SFTP server.
+//   - port: The port number to connect to on the remote server.
+//   - direction: The direction of the sync operation, either LocalToRemote or RemoteToLocal.
+//   - config: An optional *ExtraConfig object that holds additional configuration for the SFTP client.
+//     If nil, anonymous authentication will be used. If provided, it may contain the username, password,
+//     local directory, remote directory, retries, and max retries for connecting to the SFTP server.
+//
+// Return Values:
+//   - *SFTP: A pointer to the SFTP object representing the connection to the remote server.
+//   - error: If an error occurs during the connection process, it will be returned. Otherwise, it will be nil.
+//
+// Example Usage:
+//
+//	// Connect to the remote SFTP server using password-based authentication
+//	config := &ExtraConfig{
+//	  Username:   "your_username",
+//	  Password:   "your_password",
+//	  LocalDir:   "/path/to/local/directory",
+//	  RemoteDir:  "/path/to/remote/directory",
+//	  MaxRetries: 3,
+//	}
+//	sftpConn, err := Connect("example.com", 22, LocalToRemote, config)
+//	if err != nil {
+//	  log.Fatal("Failed to connect to the SFTP server:", err)
+//	}
+//	defer sftpConn.Close()
+//
+//	// Perform SFTP operations, such as initial sync and directory watching
+//	sftpConn.WatchDirectory()
 func Connect(address string, port int, direction SyncDirection, config *ExtraConfig) (*SFTP, error) {
 	var authMethod ssh.AuthMethod
 	if config != nil {
@@ -80,6 +133,42 @@ func Connect(address string, port int, direction SyncDirection, config *ExtraCon
 	}, nil
 }
 
+// ConnectSSHPair establishes an SFTP connection to the remote server at the specified address and port
+// using SSH key pair authentication. It reads the private key from the current user's home directory
+// (typically the `~/.ssh/id_rsa` file) to use for authentication.
+//
+// The function returns an *SFTP object that represents the connection, allowing you to perform file synchronization
+// and other SFTP operations between the local and remote directories.
+//
+// Parameters:
+//   - address: The IP address or hostname of the remote SFTP server.
+//   - port: The port number to connect to on the remote server.
+//   - direction: The direction of the sync operation, either LocalToRemote or RemoteToLocal.
+//   - config: An optional *ExtraConfig object that holds additional configuration for the SFTP client.
+//     If nil, default settings will be used. If provided, it may contain the username, local directory,
+//     remote directory, retries, and max retries for connecting to the SFTP server.
+//
+// Return Values:
+//   - *SFTP: A pointer to the SFTP object representing the connection to the remote server.
+//   - error: If an error occurs during the connection process, it will be returned. Otherwise, it will be nil.
+//
+// Example Usage:
+//
+//	// Connect to the remote SFTP server using SSH key pair authentication
+//	config := &ExtraConfig{
+//	  Username:   "your_username",
+//	  LocalDir:   "/path/to/local/directory",
+//	  RemoteDir:  "/path/to/remote/directory",
+//	  MaxRetries: 3,
+//	}
+//	sftpConn, err := ConnectSSHPair("example.com", 22, LocalToRemote, config)
+//	if err != nil {
+//	  log.Fatal("Failed to connect to the SFTP server:", err)
+//	}
+//	defer sftpConn.Close()
+//
+//	// Perform SFTP operations, such as initial sync and directory watching
+//	sftpConn.WatchDirectory()
 func ConnectSSHPair(address string, port int, direction SyncDirection, config *ExtraConfig) (*SFTP, error) {
 	usr, err := user.Current()
 	if err != nil {
@@ -123,10 +212,29 @@ func ConnectSSHPair(address string, port int, direction SyncDirection, config *E
 	}, nil
 }
 
+// initialSync synchronizes the local directory with the remote directory for the SFTP connection.
+// It recursively compares the files and subdirectories in the local and remote directories and performs
+// file transfers to ensure that both directories have the same content.
+//
+// The function returns an error if any issues occur during the synchronization process.
+//
+// Return Values:
+//   - error: If an error occurs during the synchronization process, it will be returned. Otherwise, it will be nil.
 func (s *SFTP) initialSync() error {
 	return s.syncDir(s.config.LocalDir, s.config.RemoteDir)
 }
 
+// syncDir synchronizes the content between the local directory and the remote directory for the SFTP connection.
+// The function recursively compares the files and subdirectories in the local and remote directories and performs
+// file transfers to ensure that both directories have the same content. The synchronization is based on the
+// specified SyncDirection (LocalToRemote or RemoteToLocal) of the SFTP connection.
+//
+// Parameters:
+//   - localDir: The local directory path to synchronize with the remote directory.
+//   - remoteDir: The remote directory path to synchronize with the local directory.
+//
+// Return Values:
+//   - error: If an error occurs during the synchronization process, it will be returned. Otherwise, it will be nil.
 func (s *SFTP) syncDir(localDir, remoteDir string) error {
 	switch s.Direction {
 	case LocalToRemote:
@@ -191,6 +299,14 @@ func (s *SFTP) syncDir(localDir, remoteDir string) error {
 	return nil
 }
 
+// checkOrCreateDir checks if the specified directory exists. If the directory does not exist, it creates it.
+// The behavior of the function depends on the SyncDirection (LocalToRemote or RemoteToLocal) of the SFTP connection.
+//
+// Parameters:
+//   - dirPath: The path of the directory to check or create.
+//
+// Return Values:
+//   - error: If an error occurs while checking or creating the directory, it will be returned. Otherwise, it will be nil.
 func (s *SFTP) checkOrCreateDir(dirPath string) error {
 	_, err := os.Stat(dirPath)
 	if os.IsNotExist(err) {
@@ -216,6 +332,42 @@ func (s *SFTP) checkOrCreateDir(dirPath string) error {
 	return nil
 }
 
+// WatchDirectory sets up a file system watcher to monitor changes in the local or remote directory,
+// depending on the SyncDirection of the SFTP connection. When a file or directory event is detected,
+// it triggers the corresponding worker to handle the event.
+//
+// The function first starts the worker pool, performs an initial synchronization of the local and remote
+// directories using the initialSync method, and then sets up the file system watcher to watch for changes.
+// The watcher is added to the specified local or remote directory, and when a file or directory is created,
+// modified, or removed, the corresponding worker is launched to handle the event.
+//
+// Note: The worker pool must be running before calling this function.
+//
+// Usage:
+//
+//	// Assume sftpConn is an established SFTP connection with a worker pool.
+//	sftpConn.WatchDirectory()
+//
+// Example:
+//
+//	// Create an SFTP connection with a worker pool.
+//	config := &ExtraConfig{
+//	  Username:    "your_username",
+//	  Password:    "your_password",
+//	  LocalDir:    "/path/to/local/directory",
+//	  RemoteDir:   "/path/to/remote/directory",
+//	  Retries:     3,
+//	  MaxRetries:  5,
+//	}
+//	sftpConn, err := Connect("your_server_address", 22, LocalToRemote, config)
+//	if err != nil {
+//	  log.Fatal("Failed to connect:", err)
+//	}
+//
+// defer sftpConn.Close()
+//
+//	// Watch for changes in the directory.
+//	go sftpConn.WatchDirectory()
 func (s *SFTP) WatchDirectory() {
 	// Starting the worker pool
 	for i := 0; i < cap(s.Pool.Tasks); i++ {
@@ -282,6 +434,17 @@ func (s *SFTP) WatchDirectory() {
 	logger.Println("Directory watch ended.")
 }
 
+// AddDirectoriesToWatcher adds the specified directory and its subdirectories to the fsnotify watcher
+// based on the SyncDirection of the SFTP connection. For a LocalToRemote connection, it adds the local
+// directory and its subdirectories to the watcher. For a RemoteToLocal connection, it dynamically monitors
+// the remote directory and its subdirectories by continuously comparing the file modifications between
+// successive calls and triggering the corresponding worker to handle the events.
+//
+// Parameters:
+//   - watcher: The fsnotify.Watcher to which the directories should be added.
+//   - rootDir: The root directory to start watching.
+//
+// Note: The function will continuously monitor the directories for changes until the SFTP context is canceled.
 func (s *SFTP) AddDirectoriesToWatcher(watcher *fsnotify.Watcher, rootDir string) error {
 	switch s.Direction {
 	case LocalToRemote:
@@ -336,6 +499,17 @@ func (s *SFTP) AddDirectoriesToWatcher(watcher *fsnotify.Watcher, rootDir string
 	return nil
 }
 
+// uploadFile uploads a file from the local directory to the remote directory using the SFTP client.
+// It locks the SFTP client to prevent concurrent uploads and ensures proper cleanup by closing
+// the source and destination files after the upload is complete or in case of an error.
+//
+// Parameters:
+//   - filePath: The path of the file in the local directory to upload.
+//
+// Returns:
+//   - error: If an error occurs during the upload process.
+//
+// Note: This function is meant to be used within the SFTP struct and should not be called directly.
 func (s *SFTP) uploadFile(filePath string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -375,6 +549,17 @@ func (s *SFTP) uploadFile(filePath string) error {
 	return err
 }
 
+// uploadFile uploads a file from the local directory to the remote directory using the SFTP client.
+// It locks the SFTP client to prevent concurrent uploads and ensures proper cleanup by closing
+// the source and destination files after the upload is complete or in case of an error.
+//
+// Parameters:
+//   - filePath: The path of the file in the local directory to upload.
+//
+// Returns:
+//   - error: If an error occurs during the upload process.
+//
+// Note: This function is meant to be used within the SFTP struct and should not be called directly.
 func (s *SFTP) downloadFile(remotePath string) error {
 
 	if strings.Contains(remotePath, ".swp") {
@@ -416,10 +601,27 @@ func (s *SFTP) downloadFile(remotePath string) error {
 	return err
 }
 
+// Mkdir creates a directory in the remote server based on the config
+// Parameters:
+//   - dir: The path of the directory to create.
+//
+// Returns:
+//   - error: If an error occurs during the upload process.
+//
+// Note: This function is meant to be used within the SFTP struct and should not be called directly.
 func (s *SFTP) Mkdir(dir string) error {
 	err := s.Client.Mkdir(filepath.Join(s.config.RemoteDir, dir))
 	return err
 }
+
+// RemoveRemoteFile removes a file from the remote server based on the config and the relative path
+// Parameters:
+//   - remotePath: The path of the file to remove.
+//
+// Returns:
+//   - error: If an error occurs during the upload process.
+//
+// Note: This function is meant to be used within the SFTP struct and should not be called directly.
 func (s *SFTP) RemoveRemoteFile(remotePath string) error {
 	relativePath, err := filepath.Rel(s.config.LocalDir, remotePath)
 	if err != nil {
@@ -430,6 +632,14 @@ func (s *SFTP) RemoveRemoteFile(remotePath string) error {
 	return err
 }
 
+// RemoveLocalFile removes a file from the local server based on the config and the relative path
+// Parameters:
+//   - localPath: The path of the file to remove.
+//
+// Returns:
+//   - error: If an error occurs during the upload process.
+//
+// Note: This function is meant to be used within the SFTP struct and should not be called directly.
 func (s *SFTP) RemoveLocalFile(localPath string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -438,8 +648,17 @@ func (s *SFTP) RemoveLocalFile(localPath string) error {
 	return err
 }
 
-// walkRemoteDir traverses a remote directory and its subdirectories,
-// adding all files it finds to the provided map.
+// walkRemoteDir traverses a remote directory and its subdirectories using the SFTP client,
+// and adds all files it finds to the provided map.
+//
+// Parameters:
+//   - dir: The path of the remote directory to traverse.
+//   - files: A map to store the file paths and their corresponding os.FileInfo.
+//
+// Returns:
+//   - error: If an error occurs during the traversal process.
+//
+// Note: This function is meant to be used within the SFTP struct and should not be called directly.
 func (s *SFTP) walkRemoteDir(dir string, files map[string]os.FileInfo) error {
 	entries, err := s.Client.ReadDir(dir)
 	if err != nil {
@@ -462,13 +681,25 @@ func (s *SFTP) walkRemoteDir(dir string, files map[string]os.FileInfo) error {
 	return nil
 }
 
+// convertRemoteToLocalPath converts the remote path to a local path based on the config
+// Parameters:
+//   - remotePath: The path of the file to convert.
+//
+// Returns:
+//   - localPath: The converted path
+//
+// Note: This function is meant to be used within the SFTP struct and should not be called directly.
 func (s *SFTP) convertRemoteToLocalPath(remotePath string) string {
 	relativePath, _ := filepath.Rel(s.config.RemoteDir, remotePath)
 	localPath := filepath.Join(s.config.LocalDir, relativePath)
 	return localPath
 }
 
-// Worker starts a new worker goroutine.
+// Worker starts a new worker goroutine that processes tasks received from the worker pool's task channel.
+// The tasks can include file events such as creation, write, and removal events received from the
+// fsnotify watcher.
+//
+// Note: This function is meant to be used within the SFTP struct and should not be called directly.
 func (s *SFTP) Worker() {
 	for task := range s.Pool.Tasks {
 		switch task.EventType {
