@@ -3,7 +3,6 @@ package ftp
 import (
 	"context"
 	"fmt"
-	"github.com/secsy/goftp"
 	"log"
 	"os"
 	"path/filepath"
@@ -11,38 +10,82 @@ import (
 	"sync"
 	"time"
 
+	"github.com/secsy/goftp"
+
 	"github.com/cploutarchou/syncpkg/worker"
 	"github.com/fsnotify/fsnotify"
 )
 
 var logger = log.New(os.Stdout, "ftp: ", log.Lshortfile)
 
+// SyncDirection is the direction of the sync (LocalToRemote or RemoteToLocal)
 type SyncDirection int
 
 const (
+	//LocalToRemote is the direction of the sync from local to remote pc/server
 	LocalToRemote SyncDirection = iota
+	//RemoteToLocal is the direction of the sync from remote to local pc/server
 	RemoteToLocal
 )
 
+// FTP is the struct that holds the ftp client and the sync direction
 type FTP struct {
 	sync.Mutex
-	client    *goftp.Client
+	//client is the ftp client that is used to connect to the ftp server
+	client *goftp.Client
+	//Direction is the direction of the sync (LocalToRemote or RemoteToLocal)
 	Direction SyncDirection
-	config    *ExtraConfig
-	Watcher   *fsnotify.Watcher
-	Pool      *worker.Pool
-	ctx       context.Context
+	//config is the struct that holds the extra config for the ftp connection
+	config *ExtraConfig
+	//Watcher is the fsnotify watcher that is used to watch the local directory
+	Watcher *fsnotify.Watcher
+	//Pool is the worker pool that is used to process the fsnotify events
+	Pool *worker.Pool
+	//ctx is the context that is used to cancel the watcher
+	ctx context.Context
 }
 
+// ExtraConfig is the struct that holds the extra config for the ftp connection
 type ExtraConfig struct {
-	Username   string
-	Password   string
-	LocalDir   string
-	RemoteDir  string
-	Retries    int
+	//Username is the username that is used to connect to the ftp server
+	Username string
+	//Password is the password that is used to connect to the ftp server
+	Password string
+	//LocalDir is the local directory that is used to sync with the remote directory
+	LocalDir string
+	//RemoteDir is the remote directory that is used to sync with the local directory
+	RemoteDir string
+	//Retries is the number of retries that the ftp client will try to upload/download a file
+	Retries int
+	//MaxRetries is the number of retries that the ftp client will try to upload/download a file
 	MaxRetries int
 }
 
+// Connect is a function used to establish a connection to an FTP server and return an FTP client for file synchronization.
+//
+// - address is the address of the FTP server.
+//
+// - port is the port of the FTP server.
+//
+// - direction is the direction of the synchronization, which can be either LocalToRemote or RemoteToLocal.
+//
+//   - config is a pointer to the ExtraConfig struct that holds additional configuration settings for the FTP connection,
+//     including FTP server credentials (username and password), local and remote directories, and synchronization retries.
+//
+// Example:
+//
+//	ftp, err := ftp.Connect("localhost", 21, ftp.LocalToRemote, &ftp.ExtraConfig{
+//	    Username:   "username",
+//	    Password:   "password",
+//	    LocalDir:   "localDir",
+//	    RemoteDir:  "remoteDir",
+//	    Retries:    3,
+//	    MaxRetries: 3,
+//	})
+//
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
 func Connect(address string, port int, direction SyncDirection, config *ExtraConfig) (*FTP, error) {
 	address = fmt.Sprintf("%s:%d", address, port)
 
@@ -67,24 +110,36 @@ func Connect(address string, port int, direction SyncDirection, config *ExtraCon
 	logger.Println("Connected to FTP server.")
 	return ftp, nil
 }
-func (f *FTP) List(path string) ([]string, error) {
-	files, err := f.client.ReadDir(path)
-	if err != nil {
-		return nil, err
-	}
 
-	var fileNames []string
-	for _, file := range files {
-		fileNames = append(fileNames, file.Name())
-	}
-
-	return fileNames, nil
-}
-
+// initialSync is a method of the FTP struct that performs the initial synchronization between the local directory
+// and the remote directory. It calls the syncDir method to handle the synchronization process.
+//
+// This method is used internally to synchronize the directories when the FTP connection is initially established.
+// The synchronization direction is determined by the value of f.Direction, which can be either LocalToRemote or RemoteToLocal.
+//
+// - Returns an error if any error occurs during the synchronization process.
 func (f *FTP) initialSync() error {
 	return f.syncDir(f.config.LocalDir, f.config.RemoteDir)
 }
 
+// syncDir is a method of the FTP struct that synchronizes files between the local directory and the remote directory.
+// The synchronization direction depends on the value of f.Direction, which can be either LocalToRemote or RemoteToLocal.
+//
+// - localDir is the path to the local directory to be synchronized.
+//
+// - remoteDir is the path to the remote directory to be synchronized with.
+//
+// If f.Direction is LocalToRemote, this method will perform the following actions:
+// - Recursively traverse the local directory and its subdirectories.
+// - Check if each file exists on the remote server. If not, it will upload the file to the server.
+// - If the file is a directory, it will create the corresponding directory on the remote server if it doesn't exist.
+//
+// If f.Direction is RemoteToLocal, this method will perform the following actions:
+// - Recursively traverse the remote directory and its subdirectories.
+// - Check if each file exists in the local file system. If not, it will download the file from the server.
+// - If the file is a directory, it will create the corresponding directory in the local file system if it doesn't exist.
+//
+// This method is used internally by the synchronization process and is not intended to be called directly.
 func (f *FTP) syncDir(localDir, remoteDir string) error {
 	logger.Println("syncDir localDir", localDir)
 	switch f.Direction {
@@ -163,6 +218,19 @@ func (f *FTP) syncDir(localDir, remoteDir string) error {
 	return nil
 }
 
+// WatchDirectory is a method of the FTP struct that sets up a file system watcher to monitor changes in the local directory.
+// It starts a worker pool and performs an initial synchronization between the local directory and the remote directory
+// based on the specified synchronization direction (LocalToRemote or RemoteToLocal).
+//
+// The method uses fsnotify package to monitor file system events such as file creations, modifications, and deletions.
+// When a file system event is detected, it creates a worker task and adds it to the worker pool for processing.
+// The worker tasks are handled by the Worker method, which performs the necessary file transfers to keep the directories in sync.
+//
+// The synchronization is bidirectional, meaning that changes made in the local directory will be propagated to the remote directory,
+// and changes made in the remote directory will be reflected in the local directory.
+//
+//   - Please note that this method enters an infinite loop to continuously monitor file system events until the context is canceled.
+//     The method will block until the context is done or an error occurs during the synchronization process.
 func (f *FTP) WatchDirectory() {
 	// Starting the worker pool
 	for i := 0; i < cap(f.Pool.Tasks); i++ {
