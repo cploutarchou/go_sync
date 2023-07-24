@@ -180,9 +180,6 @@ func (f *FTP) WatchDirectory() {
 		_ = watcher.Close()
 	}(watcher) // Moved defer to here.
 
-	events := make(chan fsnotify.Event)
-	defer close(events)
-
 	go func() {
 		for {
 			select {
@@ -194,7 +191,6 @@ func (f *FTP) WatchDirectory() {
 
 				f.Pool.WG.Add(1)
 				f.Pool.Tasks <- worker.Task{EventType: event.Op, Name: event.Name}
-				events <- event
 			case err, ok := <-watcher.Errors:
 				if !ok {
 					return
@@ -287,8 +283,8 @@ func (f *FTP) removeRemoteFile(filePath string) error {
 	f.Lock()
 	defer f.Unlock()
 
-	// Calculate the remote file path
-	remotePath := filepath.Join(f.config.RemoteDir, filepath.Base(filePath))
+	// get the remote file path from the local file path and the remote directory
+	remotePath := strings.Replace(filePath, f.config.LocalDir, f.config.RemoteDir, 1)
 
 	// Delete the file from the FTP server
 	err := f.client.Delete(remotePath)
@@ -442,4 +438,64 @@ func (f *FTP) checkOrCreateDir(dirPath string) error {
 	}
 
 	return nil
+}
+
+// Worker starts a new worker goroutine.
+func (f *FTP) Worker() {
+	defer f.Pool.WG.Done()
+	for task := range f.Pool.Tasks {
+		logger.Println("Processing task:", task)
+		switch task.EventType {
+		case fsnotify.Write:
+			switch f.Direction {
+			case LocalToRemote:
+				err := f.uploadFile(task.Name)
+				if err != nil {
+					logger.Println("Error uploading file:", err)
+				}
+			case RemoteToLocal:
+				err := f.downloadFile(task.Name)
+				if err != nil {
+					logger.Println("Error downloading file:", err)
+				}
+			}
+		case fsnotify.Remove:
+			switch f.Direction {
+			case LocalToRemote:
+				err := f.removeRemoteFile(task.Name)
+				if err != nil {
+					logger.Println("Error removing remote file:", err)
+				}
+			case RemoteToLocal:
+				err := f.removeLocalFile(task.Name)
+				if err != nil {
+					logger.Println("Error removing local file:", err)
+				}
+			}
+		case fsnotify.Rename:
+			switch f.Direction {
+			case LocalToRemote:
+				err := f.uploadFile(task.Name)
+				if err != nil {
+					logger.Println("Error uploading file:", err)
+				}
+				err = f.removeRemoteFile(task.Name)
+				if err != nil {
+					logger.Println("Error removing remote file:", err)
+				}
+			case RemoteToLocal:
+				err := f.downloadFile(task.Name)
+				if err != nil {
+					logger.Println("Error downloading file:", err)
+				}
+				err = f.removeLocalFile(task.Name)
+				if err != nil {
+					logger.Println("Error removing local file:", err)
+				}
+			}
+		case fsnotify.Chmod:
+			logger.Println("Permissions of file changed:", task.Name)
+		}
+		f.Pool.WG.Done()
+	}
 }

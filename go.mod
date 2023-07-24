@@ -6,6 +6,7 @@ require (
 	github.com/fsnotify/fsnotify v1.6.0
 	github.com/ory/dockertest v3.3.5+incompatible
 	github.com/pkg/sftp v1.13.5
+	github.com/secsy/goftp v0.0.0-20200609142545-aa2de14babf4
 	golang.org/x/crypto v0.11.0
 )
 
@@ -25,7 +26,6 @@ require (
 	github.com/opencontainers/image-spec v1.0.2 // indirect
 	github.com/opencontainers/runc v1.1.7 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
-	github.com/secsy/goftp v0.0.0-20200609142545-aa2de14babf4 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/stretchr/testify v1.8.4 // indirect
 	golang.org/x/mod v0.8.0 // indirect
