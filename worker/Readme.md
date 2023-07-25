@@ -75,6 +75,6 @@ func main() {
 
 ## License
 
-This package is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This package is licensed under the MIT License - see the [LICENSE](https://raw.githubusercontent.com/cploutarchou/syncpkg/LICENCE) file for details.
 
 The `worker` package empowers your Go applications to process tasks concurrently using a well-designed worker pool, ensuring efficient and synchronized handling of multiple tasks simultaneously.

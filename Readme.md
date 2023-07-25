@@ -143,4 +143,4 @@ func main() {
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details
+This project is licensed under the MIT License - see the [LICENSE](https://raw.githubusercontent.com/cploutarchou/syncpkg/main/LICENCE) file for details
